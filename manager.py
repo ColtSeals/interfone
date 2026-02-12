@@ -24,50 +24,63 @@ def recarregar_asterisk():
 
 def salvar_json(usuario, senha, ramal):
     dados = []
+    # Lê dados existentes se houver
     if os.path.exists(JSON_DB):
-        with open(JSON_DB, 'r') as f:
-            try:
+        try:
+            with open(JSON_DB, 'r') as f:
                 dados = json.load(f)
-            except:
-                dados = []
+        except:
+            dados = []
     
+    # Adiciona novo
     dados.append({
         "ramal": ramal,
         "usuario": usuario,
         "senha": senha,
-        "host": "IP_DA_SUA_VPS" # O app vai ler isso
+        "host": "IP_DA_VPS" 
     })
     
     with open(JSON_DB, 'w') as f:
         json.dump(dados, f, indent=4)
-    print(f">>> Dados salvos em {JSON_DB} (Use isso no seu App!)")
+    print(f">>> Dados salvos em {JSON_DB}")
 
 def adicionar_usuario():
     print("\n--- Adicionar Novo Usuário ---")
     nome = input("Nome do Usuário (sem espaços, ex: portaria): ").strip()
     ramal = input("Número do Ramal (ex: 1001): ").strip()
     
-    # Gera senha forte automática (segurança primeiro, Luanque)
-    senha = gerar_senha()
+    # === AQUI ESTÁ A MUDANÇA PARA SENHA MANUAL ===
+    senha_input = input("Digite a Senha SIP (Deixe vazio para gerar automática): ").strip()
+    
+    if senha_input:
+        senha = senha_input
+    else:
+        senha = gerar_senha()
+        print(f"(Senha gerada automaticamente: {senha})")
     
     # 1. Adiciona no PJSIP (Credenciais)
     config_pjsip = f"\n; Usuario: {nome}\n[{ramal}](template-ramal)\ninbound_auth/username={ramal}\ninbound_auth/password={senha}\n"
     
-    with open(PJSIP_USERS, "a") as f:
-        f.write(config_pjsip)
+    try:
+        with open(PJSIP_USERS, "a") as f:
+            f.write(config_pjsip)
+            
+        # 2. Adiciona no Extensions (Lógica de discagem)
+        config_ext = f"\n; Discagem para {nome}\nexten => {ramal},1,Dial(PJSIP/{ramal},30)\n same => n,Hangup()\n"
         
-    # 2. Adiciona no Extensions (Lógica de discagem)
-    config_ext = f"\n; Discagem para {nome}\nexten => {ramal},1,Dial(PJSIP/{ramal},30)\n same => n,Hangup()\n"
-    
-    with open(EXT_USERS, "a") as f:
-        f.write(config_ext)
+        with open(EXT_USERS, "a") as f:
+            f.write(config_ext)
+            
+        print(f"\n[SUCESSO] Usuário '{nome}' criado.")
+        print(f"Ramal: {ramal}")
+        print(f"Senha: {senha}")
         
-    print(f"\n[SUCESSO] Usuário '{nome}' criado.")
-    print(f"Ramal: {ramal}")
-    print(f"Senha SIP: {senha}")
-    
-    salvar_json(nome, senha, ramal)
-    recarregar_asterisk()
+        salvar_json(nome, senha, ramal)
+        recarregar_asterisk()
+        
+    except FileNotFoundError:
+        print("\n[ERRO CRÍTICO] Arquivos de configuração não encontrados.")
+        print("Rode o ./setup.sh primeiro!")
 
 def listar_usuarios():
     if os.path.exists(JSON_DB):
