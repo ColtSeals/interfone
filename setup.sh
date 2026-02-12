@@ -1,14 +1,16 @@
 #!/bin/bash
 
 # ==============================================================================
-# SCRIPT DE INSTALAÇÃO AUTOMATIZADA - INTERFONE LUANQUE (Debian 13 Safe)
+# SCRIPT DE INSTALAÇÃO AUTOMATIZADA - INTERFONE LUANQUE (Debian 13 FIX)
 # ==============================================================================
 
-echo ">>> [1/5] Verificando disponibilidade do Asterisk..."
+echo ">>> [1/5] Verificando disponibilidade REAL do Asterisk..."
 
-# Verifica se o pacote existe no repositório atual
-if ! apt-cache show asterisk > /dev/null 2>&1; then
-    echo "⚠️  ALERTA: Asterisk ausente no repositório padrão (Bug comum do Debian 13/Trixie)."
+# Verifica se existe um CANDIDATO a instalação (não apenas o nome no cache)
+CANDIDATO=$(apt-cache policy asterisk | grep Candidate | grep -v "(none)")
+
+if [ -z "$CANDIDATO" ]; then
+    echo "⚠️  ALERTA: Asterisk sem candidato de instalação (Bug do Debian 13)."
     echo ">>> Solução automática: Buscando no repositório 'Sid' (Unstable)..."
     
     # Adiciona repositório Sid temporariamente
@@ -16,23 +18,24 @@ if ! apt-cache show asterisk > /dev/null 2>&1; then
     apt update -y
     USOU_SID=1
 else
-    echo "✅ Asterisk encontrado normalmente."
+    echo "✅ Asterisk disponível para instalação."
     USOU_SID=0
 fi
 
 echo ">>> [2/5] Instalando Asterisk e Python..."
 apt install asterisk python3 -y
 
-# Se usou o Sid, remove agora para não quebrar o sistema no futuro
+# Se usou o Sid, remove agora para segurança
 if [ "$USOU_SID" -eq "1" ]; then
     echo ">>> Limpando repositórios temporários..."
     sed -i '/sid/d' /etc/apt/sources.list
     apt update -y
 fi
 
-# Verifica se instalou mesmo
-if ! command -v asterisk &> /dev/null; then
-    echo "❌ ERRO CRÍTICO: A instalação falhou. Verifique sua conexão."
+# Verifica se instalou mesmo (Prova Real)
+if ! dpkg -l | grep -q "asterisk"; then
+    echo "❌ ERRO CRÍTICO: O Asterisk não foi instalado corretamente."
+    echo "Tente rodar manualmente: apt install asterisk"
     exit 1
 fi
 
@@ -42,11 +45,11 @@ echo ">>> [3/5] Criando estrutura de arquivos..."
 [ -f /etc/asterisk/pjsip.conf ] && mv /etc/asterisk/pjsip.conf /etc/asterisk/pjsip.conf.bkp
 [ -f /etc/asterisk/extensions.conf ] && mv /etc/asterisk/extensions.conf /etc/asterisk/extensions.conf.bkp
 
-# Cria os arquivos que o Python vai usar (Vazios inicialmente)
+# Cria os arquivos que o Python vai usar
 touch /etc/asterisk/pjsip_users.conf
 touch /etc/asterisk/extensions_users.conf
 
-# PERMISSÃO TOTAL (777) para evitar qualquer erro de "Permission Denied" no Python
+# PERMISSÃO TOTAL (777)
 chmod 777 /etc/asterisk/pjsip_users.conf
 chmod 777 /etc/asterisk/extensions_users.conf
 
@@ -63,7 +66,7 @@ type=transport
 protocol=udp
 bind=0.0.0.0:5060
 
-; Template para ramais (Com correção de NAT para telefones fisicos)
+; Template para ramais (Com correção de NAT)
 [template-ramal](!)
 type=wizard
 accepts_auth=yes
