@@ -1,40 +1,58 @@
 #!/bin/bash
 
-# === CORREÇÃO AUTOMÁTICA DE REPOSITÓRIO (DEBIAN 13/TRIXIE) ===
-echo ">>> Verificando disponibilidade do Asterisk..."
+# ==============================================================================
+# SCRIPT DE INSTALAÇÃO AUTOMATIZADA - INTERFONE LUANQUE (Debian 13 Safe)
+# ==============================================================================
+
+echo ">>> [1/5] Verificando disponibilidade do Asterisk..."
+
+# Verifica se o pacote existe no repositório atual
 if ! apt-cache show asterisk > /dev/null 2>&1; then
-    echo "[AVISO] Asterisk não encontrado no repositório padrão (Bug do Debian Trixie)."
-    echo ">>> Adicionando repositório 'Sid' temporariamente..."
+    echo "⚠️  ALERTA: Asterisk ausente no repositório padrão (Bug comum do Debian 13/Trixie)."
+    echo ">>> Solução automática: Buscando no repositório 'Sid' (Unstable)..."
+    
+    # Adiciona repositório Sid temporariamente
     echo "deb http://deb.debian.org/debian sid main" >> /etc/apt/sources.list
-    apt update
-    INSTALOU_VIA_SID=1
+    apt update -y
+    USOU_SID=1
 else
-    echo ">>> Asterisk encontrado nos repositórios padrão."
-    INSTALOU_VIA_SID=0
+    echo "✅ Asterisk encontrado normalmente."
+    USOU_SID=0
 fi
 
-echo ">>> Instalando Asterisk e Python..."
+echo ">>> [2/5] Instalando Asterisk e Python..."
 apt install asterisk python3 -y
 
-if [ "$INSTALOU_VIA_SID" -eq "1" ]; then
-    echo ">>> Removendo repositório 'Sid' para manter o sistema estável..."
+# Se usou o Sid, remove agora para não quebrar o sistema no futuro
+if [ "$USOU_SID" -eq "1" ]; then
+    echo ">>> Limpando repositórios temporários..."
     sed -i '/sid/d' /etc/apt/sources.list
-    apt update
+    apt update -y
 fi
 
-# === CONFIGURAÇÃO DOS ARQUIVOS ===
-echo ">>> Backup das configs originais..."
-[ -f /etc/asterisk/pjsip.conf ] && mv /etc/asterisk/pjsip.conf /etc/asterisk/pjsip.conf.bak
-[ -f /etc/asterisk/extensions.conf ] && mv /etc/asterisk/extensions.conf /etc/asterisk/extensions.conf.bak
+# Verifica se instalou mesmo
+if ! command -v asterisk &> /dev/null; then
+    echo "❌ ERRO CRÍTICO: A instalação falhou. Verifique sua conexão."
+    exit 1
+fi
 
-echo ">>> Criando estrutura de arquivos..."
-# Garante que os arquivos existam e tenham permissão total para evitar erro no Python
+echo ">>> [3/5] Criando estrutura de arquivos..."
+
+# Backup se já existir
+[ -f /etc/asterisk/pjsip.conf ] && mv /etc/asterisk/pjsip.conf /etc/asterisk/pjsip.conf.bkp
+[ -f /etc/asterisk/extensions.conf ] && mv /etc/asterisk/extensions.conf /etc/asterisk/extensions.conf.bkp
+
+# Cria os arquivos que o Python vai usar (Vazios inicialmente)
 touch /etc/asterisk/pjsip_users.conf
 touch /etc/asterisk/extensions_users.conf
+
+# PERMISSÃO TOTAL (777) para evitar qualquer erro de "Permission Denied" no Python
 chmod 777 /etc/asterisk/pjsip_users.conf
 chmod 777 /etc/asterisk/extensions_users.conf
 
-# Criando pjsip.conf base
+echo ">>> [4/5] Configurando Asterisk (PJSIP e Dialplan)..."
+
+# Cria o PJSIP.CONF mestre
 cat <<EOF > /etc/asterisk/pjsip.conf
 [global]
 type=global
@@ -45,7 +63,7 @@ type=transport
 protocol=udp
 bind=0.0.0.0:5060
 
-; Template base para usuarios
+; Template para ramais (Com correção de NAT para telefones fisicos)
 [template-ramal](!)
 type=wizard
 accepts_auth=yes
@@ -56,24 +74,29 @@ endpoint/disallow=all
 endpoint/allow=ulaw,alaw,gsm,opus
 endpoint/direct_media=no
 endpoint/rewrite_contact=yes
+endpoint/rtp_symmetric=yes
+endpoint/force_rport=yes
 aor/max_contacts=2
 
-; Inclui os usuarios gerados pelo Python
+; Importa usuarios do script Python
 #include pjsip_users.conf
 EOF
 
-# Criando extensions.conf base
+# Cria o EXTENSIONS.CONF mestre
 cat <<EOF > /etc/asterisk/extensions.conf
 [interfone-ctx]
-; Inclui o plano de discagem dos usuarios
+; Importa logica dos usuarios do script Python
 #include extensions_users.conf
 
-; Rejeita o resto
+; Bloqueia chamadas externas nao autorizadas
 exten => _X.,1,Hangup()
 EOF
 
-echo ">>> Reiniciando Asterisk..."
+echo ">>> [5/5] Finalizando..."
 systemctl restart asterisk
 systemctl enable asterisk
 
-echo ">>> Instalação Concluída! Pode rodar 'python3 manager.py'"
+echo "========================================================="
+echo "✅ INSTALAÇÃO CONCLUÍDA COM SUCESSO!"
+echo "Pode rodar o menu agora: python3 manager.py"
+echo "========================================================="
