@@ -1,27 +1,26 @@
 #!/bin/bash
-# SETUP BLINDADO - INTERFONE OPERACIONAL
+# SETUP PREMIUM - INTERFONE INTELIGENTE v6.0
 
-echo ">>> [1/3] Corrigindo Repositorios e Instalando Asterisk..."
-CANDIDATO=$(apt-cache policy asterisk | grep Candidate | grep -v "(none)")
-if [ -z "$CANDIDATO" ]; then
-    echo "deb http://deb.debian.org/debian sid main" >> /etc/apt/sources.list
-    apt update -y && apt install asterisk python3 python3-pip -y
-    sed -i '/sid/d' /etc/apt/sources.list
-    apt update -y
-else
-    apt update -y && apt install asterisk python3 -y
-fi
+echo ">>> [1/4] Instalando Dependências..."
+apt update -y && apt install asterisk python3 python3-pip ufw -y
 
-echo ">>> [2/3] Criando Estrutura de Arquivos..."
+echo ">>> [2/4] Configurando Segurança e Firewall..."
+ufw allow 22/tcp
+ufw allow 5060/udp
+ufw allow 10000:20000/udp
+ufw --force enable
+
+echo ">>> [3/4] Estruturando Asterisk..."
 mkdir -p /etc/asterisk
 touch /etc/asterisk/pjsip_users.conf /etc/asterisk/extensions_users.conf
-chmod 777 /etc/asterisk/pjsip_users.conf /etc/asterisk/extensions_users.conf
+chmod -R 777 /etc/asterisk/
+chmod -R 777 /var/log/asterisk/
 
-# PJSIP MASTER CONFIG
+# Criando PJSIP Base
 cat <<EOF > /etc/asterisk/pjsip.conf
 [global]
 type=global
-user_agent=Interfone_Operacional_V2
+user_agent=Interfone_Premium_v6
 
 [transport-udp]
 type=transport
@@ -31,21 +30,17 @@ bind=0.0.0.0:5060
 #include pjsip_users.conf
 EOF
 
-# EXTENSIONS MASTER CONFIG
+# Criando Dialplan Base
 cat <<EOF > /etc/asterisk/extensions.conf
 [interfone-ctx]
+; Ramal de Emergência/Portaria (0)
+exten => 0,1,Dial(PJSIP/1000,30)
+ same => n,Hangup()
+
 #include extensions_users.conf
-exten => _X.,1,Hangup()
 EOF
 
-echo ">>> [3/3] Ajustando Firewall e Servico..."
-# Abre a porta 5060 UDP e o range de audio RTP
-apt install ufw -y
-ufw allow 5060/udp
-ufw allow 10000:20000/udp
-ufw --force enable
-
+echo ">>> [4/4] Reiniciando Serviços..."
 systemctl restart asterisk
 systemctl enable asterisk
-
-echo "✅ AMBIENTE OPERACIONAL PRONTO!"
+echo "✅ AMBIENTE PREMIUM PRONTO!"
