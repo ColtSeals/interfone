@@ -1,636 +1,470 @@
 #!/usr/bin/env python3
-import json
 import os
-import re
-import subprocess
+import json
 import time
+import secrets
+import subprocess
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
+from rich.console import Console
+from rich.table import Table
+from rich.live import Live
+from rich.panel import Panel
+from rich import box
 import psutil
-from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical, Container
-from textual.reactive import reactive
-from textual.screen import ModalScreen
-from textual.widgets import (
-    Header, Footer, Static, DataTable, Button, Input, Label, RichLog
-)
 
-# =========================
-# Paths (Debian padrão)
-# =========================
-APP_DIR = "/opt/interfone"
-DATA_DIR = f"{APP_DIR}/data"
-DB_FILE = f"{DATA_DIR}/condominio.json"
+C = Console()
 
-AST_PJSIP_USERS = "/etc/asterisk/pjsip_users.conf"
-AST_EXT_USERS = "/etc/asterisk/extensions_users.conf"
+DB_PATH = "/opt/interfone/db.json"
 
-AST_LOG_MESSAGES = "/var/log/asterisk/messages"
-AST_LOG_FULL = "/var/log/asterisk/full"
-AST_CDR_MASTER = "/var/log/asterisk/cdr-csv/Master.csv"
+P_USERS = "/etc/asterisk/pjsip_users.conf"
+E_USERS = "/etc/asterisk/extensions_users.conf"
 
-PORTARIA_ENDPOINT = "1000"   # PJSIP/1000 (portaria)
-PORTARIA_SHORT_EXT = "0"     # discagem rápida 0
+ASTERISK_BIN = "asterisk"
 
-# =========================
-# Model
-# =========================
+DEFAULT_RTP = "10000-20000"
+DEFAULT_TRANSPORT = "transport-udp"
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def sh(cmd: List[str], check: bool = False) -> Tuple[int, str, str]:
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"cmd failed: {' '.join(cmd)}\n{p.stderr}")
+    return p.returncode, p.stdout, p.stderr
+
+def asterisk_rx(command: str) -> str:
+    rc, out, err = sh([ASTERISK_BIN, "-rx", command])
+    return out if out else err
+
+def systemctl_is_active(unit: str) -> bool:
+    rc, out, _ = sh(["systemctl", "is-active", unit])
+    return (rc == 0) and ("active" in out)
+
+def uptime_pretty() -> str:
+    try:
+        return asterisk_rx("core show uptime").splitlines()[0].strip()
+    except Exception:
+        boot = psutil.boot_time()
+        secs = int(time.time() - boot)
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        return f"up {h}h {m}m"
+
+def ram_pretty() -> str:
+    vm = psutil.virtual_memory()
+    used = vm.used // (1024**2)
+    total = vm.total // (1024**2)
+    return f"{used}MB/{total}MB"
+
+def ensure_root():
+    if os.geteuid() != 0:
+        C.print("[bold red]Rode como root:[/bold red] sudo interfone")
+        raise SystemExit(1)
+
+# -----------------------------
+# Data model
+# -----------------------------
 @dataclass
-class User:
-    ramal: str
-    senha: str
-    nome: str
-    bloco: str
-    ap: str
-    allowed: List[str]
+class Resident:
+    id: str
+    name: str
+    sip: str
+    password: str
+    priority: int = 10
+    # WhatsApp (Evolution) - placeholder (não expomos pra portaria)
+    wa_enabled: bool = False
+    wa_number_enc: Optional[str] = None  # você pode criptografar depois
 
-    def callerid(self) -> str:
-        # Ex: "Luanque (BlA-Ap101)" <101>
-        safe_name = self.nome.replace('"', "").strip()
-        safe_bl = self.bloco.replace(" ", "").strip()
-        safe_ap = self.ap.replace(" ", "").strip()
-        return f"\"{safe_name} (Bl{safe_bl}-Ap{safe_ap})\" <{self.ramal}>"
+@dataclass
+class Apartment:
+    id: str                # "A-101" ou "101"
+    label: str             # "Bloco A Ap 101"
+    dial_ext: str          # "101" (o número que a portaria disca)
+    strategy: str          # "sequential" | "parallel"
+    ring_seconds: int
+    residents: List[Resident]
 
+def _default_db() -> Dict:
+    return {"apartments": []}
 
-# =========================
-# Backend (Asterisk + DB)
-# =========================
-class InterfoneBackend:
-    def __init__(self) -> None:
-        self.sip_logger_on = False
-        self._last_log_pos = 0
-        self._log_cache: List[str] = []
+def load_db() -> Dict:
+    if not os.path.exists(DB_PATH):
+        return _default_db()
+    try:
+        with open(DB_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return _default_db()
 
-    # ---------- Helpers ----------
-    @staticmethod
-    def _run(cmd: List[str], timeout: int = 6) -> Tuple[int, str]:
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            out = (p.stdout or "") + (p.stderr or "")
-            return p.returncode, out.strip()
-        except Exception as e:
-            return 1, str(e)
+def save_db(db: Dict) -> None:
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    tmp = DB_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(db, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, DB_PATH)
+    os.chmod(DB_PATH, 0o640)
 
-    @staticmethod
-    def asterisk_rx(command: str) -> str:
-        code, out = InterfoneBackend._run(["asterisk", "-rx", command])
-        return out if code == 0 else ""
-
-    @staticmethod
-    def systemctl_is_active(service: str) -> bool:
-        code, out = InterfoneBackend._run(["systemctl", "is-active", service])
-        return code == 0 and "active" in out
-
-    # ---------- DB ----------
-    def load_db(self) -> Tuple[Dict, List[User]]:
-        if not os.path.exists(DB_FILE):
-            return {"meta": {"name": "Condominio"}, "users": []}, []
-
-        try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-        except Exception:
-            raw = {"meta": {"name": "Condominio"}, "users": []}
-
-        users: List[User] = []
-        for u in raw.get("users", []):
-            users.append(User(
-                ramal=str(u.get("ramal", "")).strip(),
-                senha=str(u.get("senha", "")).strip(),
-                nome=str(u.get("nome", "")).strip(),
-                bloco=str(u.get("bloco", "")).strip(),
-                ap=str(u.get("ap", "")).strip(),
-                allowed=list(u.get("allowed", ["0"]))  # por padrão, liga pra portaria
-            ))
-        return raw, users
-
-    def save_db(self, meta: Dict, users: List[User]) -> None:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        payload = {
-            "meta": meta.get("meta", {"name": "Condominio", "updated_at": "now"}),
-            "users": [
-                {
-                    "ramal": u.ramal,
-                    "senha": u.senha,
-                    "nome": u.nome,
-                    "bloco": u.bloco,
-                    "ap": u.ap,
-                    "allowed": u.allowed,
-                } for u in users
-            ]
-        }
-        payload["meta"]["updated_at"] = datetime.now().isoformat(timespec="seconds")
-
-        tmp = DB_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, DB_FILE)
-
-        try:
-            os.chmod(DB_FILE, 0o640)
-        except Exception:
-            pass
-
-    # ---------- Sync configs ----------
-    def sync_to_asterisk(self, users: List[User]) -> None:
-        # Gera PJSIP users + dialplan por usuário (contexto individual com ACL de discagem)
-        pjsip_lines: List[str] = []
-        ext_lines: List[str] = []
-
-        for u in users:
-            r = u.ramal
-            s = u.senha
-            cid = u.callerid()
-
-            # PJSIP (usando templates)
-            pjsip_lines += [
-                f"; ===== USER {r} =====",
-                f"[{r}](auth-template)",
-                f"username={r}",
-                f"password={s}",
-                "",
-                f"[{r}](aor-template)",
-                "",
-                f"[{r}](endpoint-template)",
-                f"auth={r}",
-                f"aors={r}",
-                f"callerid={cid}",
-                f"context=interfone-{r}",
-                "",
-            ]
-
-            # Dialplan por contexto (Allowed destinations)
-            allowed = [x.strip() for x in (u.allowed or []) if x.strip()]
-            if PORTARIA_SHORT_EXT not in allowed:
-                allowed.insert(0, PORTARIA_SHORT_EXT)
-
-            ext_lines += [
-                f"; ===== CONTEXT {r} ({u.nome}) =====",
-                f"[interfone-{r}]",
-                f"exten => {r},1,NoOp(Chamada interna p/ {u.nome})",
-                f" same => n,Dial(PJSIP/{r},30)",
-                f" same => n,Hangup()",
-                "",
-                f"; Discagens permitidas (ACL)",
-            ]
-
-            for dest in allowed:
-                if dest == PORTARIA_SHORT_EXT:
-                    ext_lines += [
-                        f"exten => {PORTARIA_SHORT_EXT},1,NoOp({u.nome} chamando Portaria)",
-                        f" same => n,Dial(PJSIP/{PORTARIA_ENDPOINT},30)",
-                        f" same => n,Hangup()",
-                        "",
-                    ]
-                else:
-                    # permite discar ramais específicos
-                    ext_lines += [
-                        f"exten => {dest},1,NoOp({u.nome} chamando {dest})",
-                        f" same => n,Dial(PJSIP/{dest},30)",
-                        f" same => n,Hangup()",
-                        "",
-                    ]
-
-            # fallback (nega tudo)
-            ext_lines += [
-                f"exten => _X.,1,NoOp(NEGADO: {u.nome} tentou discar ${{EXTEN}})",
-                f" same => n,Hangup()",
-                "",
-            ]
-
-        self._safe_write(AST_PJSIP_USERS, "\n".join(pjsip_lines).strip() + "\n")
-        self._safe_write(AST_EXT_USERS, "\n".join(ext_lines).strip() + "\n")
-
-        # reload
-        self.asterisk_reload()
-
-    @staticmethod
-    def _safe_write(path: str, content: str) -> None:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(content)
-        os.replace(tmp, path)
-        try:
-            os.chmod(path, 0o640)
-        except Exception:
-            pass
-
-    # ---------- Controls ----------
-    def asterisk_reload(self) -> None:
-        self.asterisk_rx("core reload")
-
-    def toggle_sip_logger(self) -> bool:
-        self.sip_logger_on = not self.sip_logger_on
-        self.asterisk_rx("pjsip set logger " + ("on" if self.sip_logger_on else "off"))
-        return self.sip_logger_on
-
-    # ---------- State collectors ----------
-    def collect_system(self) -> Dict:
-        vm = psutil.virtual_memory()
-        du = psutil.disk_usage("/")
-        cpu = psutil.cpu_percent(interval=None)
-        boot = datetime.fromtimestamp(psutil.boot_time())
-        uptime = datetime.now() - boot
-
-        return {
-            "cpu": cpu,
-            "ram_used_gb": vm.used / (1024**3),
-            "ram_total_gb": vm.total / (1024**3),
-            "disk_used_gb": du.used / (1024**3),
-            "disk_total_gb": du.total / (1024**3),
-            "uptime": str(uptime).split(".")[0],
-        }
-
-    def collect_endpoints(self) -> Dict[str, Dict]:
-        """
-        Retorna status por ramal usando:
-        - pjsip show contacts  (online/offline + RTT)
-        """
-        out = self.asterisk_rx("pjsip show contacts")
-        status: Dict[str, Dict] = {}
-
-        # Exemplo de linha (varia):
-        #  101/sip:101@1.2.3.4:5060;...  Avail  23.456ms
-        for line in out.splitlines():
-            line = line.strip()
-            if not line or line.lower().startswith("contact:") or line.lower().startswith("=== "):
-                continue
-            if "/" not in line:
-                continue
-
-            parts = re.split(r"\s+", line)
-            if len(parts) < 2:
-                continue
-
-            aor_uri = parts[0]
-            aor = aor_uri.split("/")[0]
-            st = parts[1]
-            rtt = parts[2] if len(parts) >= 3 else ""
-            online = st.lower().startswith("avail")
-
-            status[aor] = {
-                "online": online,
-                "status": st,
-                "rtt": rtt,
-                "contact": aor_uri.split("/", 1)[1] if "/" in aor_uri else "",
-            }
-
-        return status
-
-    def collect_active_calls(self) -> List[Dict]:
-        out = self.asterisk_rx("core show channels concise")
-        calls: List[Dict] = []
-        for line in out.splitlines():
-            if "!" not in line:
-                continue
-            parts = line.split("!")
-            if len(parts) < 8:
-                continue
-            channel, context, exten, _, state, app, data, callerid = parts[:8]
-            calls.append({
-                "channel": channel,
-                "context": context,
-                "exten": exten,
-                "state": state,
-                "app": app,
-                "callerid": callerid,
-                "data": data,
-            })
-        return calls
-
-    def collect_recent_cdr(self, limit: int = 25) -> List[Dict]:
-        if not os.path.exists(AST_CDR_MASTER):
-            return []
-        try:
-            with open(AST_CDR_MASTER, "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.read().splitlines()
-        except Exception:
-            return []
-
-        # Pega últimas linhas úteis
-        tail = [l for l in lines[-(limit * 2):] if l.strip()][-limit:]
-        items: List[Dict] = []
-
-        # Master.csv formato Asterisk (padrão):
-        # accountcode,src,dst,dcontext,clid,channel,dstchannel,lastapp,lastdata,start,answer,end,duration,billsec,disposition,amaflags,uniqueid,userfield
-        for l in reversed(tail):
-            cols = self._csv_split(l)
-            if len(cols) < 15:
-                continue
-            items.append({
-                "src": cols[1],
-                "dst": cols[2],
-                "clid": cols[4],
-                "start": cols[9],
-                "duration": cols[12],
-                "billsec": cols[13],
-                "disp": cols[14],
-            })
-        return items
-
-    @staticmethod
-    def _csv_split(line: str) -> List[str]:
-        # split CSV simples preservando aspas
-        out = []
-        cur = ""
-        inq = False
-        for ch in line:
-            if ch == '"':
-                inq = not inq
-                cur += ch
-            elif ch == "," and not inq:
-                out.append(cur.strip().strip('"'))
-                cur = ""
-            else:
-                cur += ch
-        out.append(cur.strip().strip('"'))
-        return out
-
-    def tail_tactical_logs(self, max_lines: int = 120) -> List[str]:
-        """
-        Tail incremental com filtro tático (register/auth/dial/hangup).
-        """
-        path = AST_LOG_MESSAGES if os.path.exists(AST_LOG_MESSAGES) else AST_LOG_FULL
-        if not os.path.exists(path):
-            return ["(log do Asterisk não encontrado em /var/log/asterisk)"]
-
-        # Leitura incremental (mantém ponteiro simples)
-        try:
-            size = os.path.getsize(path)
-            if self._last_log_pos > size:
-                self._last_log_pos = 0
-
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                f.seek(self._last_log_pos)
-                chunk = f.read()
-                self._last_log_pos = f.tell()
-        except Exception as e:
-            return [f"(erro lendo log: {e})"]
-
-        if chunk:
-            for raw in chunk.splitlines():
-                line = raw.strip()
-                if not line:
-                    continue
-
-                key = line.lower()
-                if (
-                    "registered" in key or
-                    "unregistered" in key or
-                    "unauthorized" in key or
-                    "failed" in key and "auth" in key or
-                    "dial" in key or
-                    "hangup" in key or
-                    "call" in key and "answered" in key
-                ):
-                    self._log_cache.append(line)
-
-            # limita cache
-            self._log_cache = self._log_cache[-1000:]
-
-        return self._log_cache[-max_lines:]
-
-
-# =========================
-# UI (Textual) - Modal Add
-# =========================
-class AddUserModal(ModalScreen[Optional[User]]):
-    def compose(self) -> ComposeResult:
-        yield Container(
-            Vertical(
-                Label("Cadastrar Morador (Tactical)", id="title"),
-                Input(placeholder="Nome do morador", id="nome"),
-                Horizontal(
-                    Input(placeholder="Bloco/Torre (ex: A)", id="bloco"),
-                    Input(placeholder="Apartamento (ex: 101)", id="ap"),
-                ),
-                Horizontal(
-                    Input(placeholder="Ramal (ex: 101)", id="ramal"),
-                    Input(placeholder="Senha SIP (vazio => coltseals)", id="senha", password=True),
-                ),
-                Input(placeholder="Permitidos (ex: 0,101,102) | vazio => só portaria (0)", id="allowed"),
-                Horizontal(
-                    Button("Salvar + Sync", variant="success", id="save"),
-                    Button("Cancelar", variant="error", id="cancel"),
-                ),
-                id="modal",
-            ),
-            id="modal_wrap"
-        )
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "cancel":
-            self.dismiss(None)
-            return
-
-        nome = self.query_one("#nome", Input).value.strip()
-        bloco = self.query_one("#bloco", Input).value.strip()
-        ap = self.query_one("#ap", Input).value.strip()
-        ramal = self.query_one("#ramal", Input).value.strip()
-        senha = self.query_one("#senha", Input).value.strip() or "coltseals"
-        allowed_raw = self.query_one("#allowed", Input).value.strip()
-
-        if not (nome and bloco and ap and ramal):
-            # mantém modal aberto
-            return
-
-        allowed = [x.strip() for x in allowed_raw.split(",") if x.strip()] if allowed_raw else ["0"]
-
-        self.dismiss(User(
-            ramal=ramal,
-            senha=senha,
-            nome=nome,
-            bloco=bloco,
-            ap=ap,
-            allowed=allowed
+def list_apartments(db: Dict) -> List[Apartment]:
+    out: List[Apartment] = []
+    for a in db.get("apartments", []):
+        rs = [Resident(**r) for r in a.get("residents", [])]
+        out.append(Apartment(
+            id=a["id"],
+            label=a["label"],
+            dial_ext=a["dial_ext"],
+            strategy=a.get("strategy", "sequential"),
+            ring_seconds=int(a.get("ring_seconds", 20)),
+            residents=rs
         ))
+    return out
 
+def find_apartment(db: Dict, ap_id: str) -> Optional[Dict]:
+    for a in db.get("apartments", []):
+        if a.get("id") == ap_id or a.get("dial_ext") == ap_id:
+            return a
+    return None
 
-# =========================
-# Tactical App
-# =========================
-class InterfoneTactical(App):
-    CSS = """
-    #root { height: 100%; }
-    #main { height: 1fr; }
-    #left { width: 40%; min-width: 48; }
-    #right { width: 60%; }
-    #stats { height: auto; padding: 1; }
-    #hint { height: auto; padding: 1; }
-    #tables { height: 1fr; }
-    #users_table { height: 1fr; }
-    #calls_table { height: 1fr; }
-    #log { height: 1fr; }
-    #modal_wrap { align: center middle; height: 100%; }
-    #modal { width: 78; padding: 1; border: round $accent; background: $panel; }
-    #title { text-style: bold; padding-bottom: 1; }
+def gen_pass() -> str:
+    return secrets.token_urlsafe(10)
+
+# -----------------------------
+# Status (online / busy)
+# -----------------------------
+def get_contact_status_map() -> Dict[str, str]:
     """
+    Returns: sip -> "Avail" | "NonQual" | "Unknown" | etc.
+    """
+    txt = asterisk_rx("pjsip show contacts")
+    m: Dict[str, str] = {}
+    for line in txt.splitlines():
+        line = line.strip()
+        if not line.startswith("Contact:"):
+            continue
+        # Example: Contact:  1011/sip:1011@1.2.3.4:5060;ob  Avail         23.123
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        # parts[1] is like "1011/sip:..."
+        sip = parts[1].split("/")[0]
+        status = parts[2]  # often Avail/NonQual/Unknown
+        m[sip] = status
+    return m
 
-    BINDINGS = [
-        ("a", "add_user", "Add"),
-        ("d", "delete_user", "Delete"),
-        ("s", "sync", "Sync"),
-        ("r", "reload_ast", "Reload"),
-        ("l", "toggle_logger", "Logger"),
-        ("q", "quit", "Quit"),
-    ]
+def get_busy_set() -> set:
+    """
+    Uses channel list to mark extensions currently in call.
+    """
+    txt = asterisk_rx("core show channels concise")
+    busy = set()
+    for line in txt.splitlines():
+        # PJSIP/1011-0000000a!from-internal!101!...
+        if line.startswith("PJSIP/"):
+            ch = line.split("!")[0]  # PJSIP/1011-0000000a
+            ext = ch.split("/")[1].split("-")[0]
+            busy.add(ext)
+    return busy
 
-    backend = InterfoneBackend()
+def asterisk_ok() -> bool:
+    return systemctl_is_active("asterisk")
 
-    # reactive state
-    ast_online = reactive(False)
-    last_sync = reactive("—")
-    condo_name = reactive("Condominio")
+# -----------------------------
+# Asterisk config generation
+# -----------------------------
+def sync_asterisk(db: Dict) -> None:
+    aps = list_apartments(db)
 
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
-        with Horizontal(id="main"):
-            with Vertical(id="left"):
-                yield Static("", id="stats")
-                yield Static("", id="hint")
-                yield DataTable(id="users_table")
-                yield DataTable(id="calls_table")
-            with Vertical(id="right"):
-                yield RichLog(id="log", wrap=True, markup=False)
-        yield Footer()
+    p_lines: List[str] = []
+    e_lines: List[str] = []
 
-    def on_mount(self) -> None:
-        if os.geteuid() != 0:
-            self.exit(message="Rode como root: sudo python interfone.py")
+    # Create one dialplan for each apartment dial_ext
+    for ap in aps:
+        # Order by priority
+        residents = sorted(ap.residents, key=lambda r: (r.priority, r.name.lower()))
 
-        # Setup tables
-        users = self.query_one("#users_table", DataTable)
-        users.add_columns("Ramal", "Local", "Morador", "Status", "RTT")
-        users.zebra_stripes = True
+        # PJSIP entries for each resident (SIP unique per person)
+        for r in residents:
+            callerid = f"\"{r.name} ({ap.label})\" <{r.sip}>"
 
-        calls = self.query_one("#calls_table", DataTable)
-        calls.add_columns("Tipo", "SRC", "DST", "Estado", "Info")
-        calls.zebra_stripes = True
+            p_lines.append(f"[{r.sip}]\n"
+                           f"type=auth\n"
+                           f"auth_type=userpass\n"
+                           f"username={r.sip}\n"
+                           f"password={r.password}\n")
 
-        log = self.query_one("#log", RichLog)
-        log.write("[Tactical] Painel iniciado. Aguardando telemetria...")
+            p_lines.append(f"[{r.sip}]\n"
+                           f"type=aor\n"
+                           f"max_contacts=5\n"
+                           f"remove_existing=yes\n"
+                           f"qualify_frequency=30\n")
 
-        self.set_interval(1.0, self.refresh_all)
+            p_lines.append(f"[{r.sip}]\n"
+                           f"type=endpoint\n"
+                           f"context=interfone-ctx\n"
+                           f"disallow=all\n"
+                           f"allow=ulaw,alaw,gsm,opus\n"
+                           f"auth={r.sip}\n"
+                           f"aors={r.sip}\n"
+                           f"callerid={callerid}\n"
+                           f"transport={DEFAULT_TRANSPORT}\n"
+                           f"rtp_symmetric=yes\n"
+                           f"force_rport=yes\n"
+                           f"rewrite_contact=yes\n"
+                           f"direct_media=no\n")
 
-    # ---------- Actions ----------
-    def action_add_user(self) -> None:
-        self.push_screen(AddUserModal(), self._on_add_user_done)
+            # Direct call to resident (optional)
+            e_lines.append(
+                f"exten => {r.sip},1,NoOp(Chamada direta para {r.name} | {ap.label})\n"
+                f" same => n,Dial(PJSIP/{r.sip},30)\n"
+                f" same => n,Hangup()\n"
+            )
 
-    def _on_add_user_done(self, user: Optional[User]) -> None:
-        if not user:
-            return
-        meta, users = self.backend.load_db()
+        # Apartment virtual extension (portaria calls ap.dial_ext)
+        e_lines.append(f"; ===============================\n"
+                       f"; AP: {ap.label} | EXT: {ap.dial_ext} | STRAT: {ap.strategy}\n"
+                       f"; ===============================\n"
+                       f"exten => {ap.dial_ext},1,NoOp(PORTARIA -> {ap.label})\n")
 
-        # evita duplicados
-        users = [u for u in users if u.ramal != user.ramal]
-        users.append(user)
+        if not residents:
+            e_lines.append(" same => n,NoOp(SEM MORADORES CADASTRADOS)\n"
+                           " same => n,Playback(vm-nobodyavail)\n"
+                           " same => n,Hangup()\n")
+            continue
 
-        self.backend.save_db(meta, users)
-        self.backend.sync_to_asterisk(users)
-        self.last_sync = datetime.now().strftime("%H:%M:%S")
-
-        self.query_one("#log", RichLog).write(f"[DB] Morador {user.nome} (ramal {user.ramal}) salvo + sync.")
-
-    def action_delete_user(self) -> None:
-        table = self.query_one("#users_table", DataTable)
-        if table.row_count == 0 or table.cursor_row is None:
-            return
-
-        ramal = str(table.get_cell_at(table.cursor_row, 0))
-        if not ramal:
-            return
-
-        meta, users = self.backend.load_db()
-        users2 = [u for u in users if u.ramal != ramal]
-        self.backend.save_db(meta, users2)
-        self.backend.sync_to_asterisk(users2)
-        self.last_sync = datetime.now().strftime("%H:%M:%S")
-        self.query_one("#log", RichLog).write(f"[DB] Removido ramal {ramal} + sync.")
-
-    def action_sync(self) -> None:
-        meta, users = self.backend.load_db()
-        self.backend.sync_to_asterisk(users)
-        self.last_sync = datetime.now().strftime("%H:%M:%S")
-        self.query_one("#log", RichLog).write("[AST] Sync manual executado (PJSIP + Dialplan + reload).")
-
-    def action_reload_ast(self) -> None:
-        self.backend.asterisk_reload()
-        self.query_one("#log", RichLog).write("[AST] core reload executado.")
-
-    def action_toggle_logger(self) -> None:
-        state = self.backend.toggle_sip_logger()
-        self.query_one("#log", RichLog).write(f"[AST] PJSIP logger: {'ON' if state else 'OFF'}")
-
-    # ---------- Refresh ----------
-    def refresh_all(self) -> None:
-        # System + Asterisk status
-        sysinfo = self.backend.collect_system()
-        self.ast_online = self.backend.systemctl_is_active("asterisk")
-
-        meta, users = self.backend.load_db()
-        self.condo_name = meta.get("meta", {}).get("name", "Condominio")
-
-        endpoint_status = self.backend.collect_endpoints()
-        active_calls = self.backend.collect_active_calls()
-        recent_cdr = self.backend.collect_recent_cdr(limit=12)
-        logs = self.backend.tail_tactical_logs(max_lines=120)
-
-        # Render stats
-        ast = "ONLINE" if self.ast_online else "OFFLINE"
-        stats = (
-            f"🏢 {self.condo_name}\n"
-            f"🛰️  ASTERISK: {ast}   |   Last Sync: {self.last_sync}\n"
-            f"⚙️  CPU: {sysinfo['cpu']:.1f}%   "
-            f"🧠 RAM: {sysinfo['ram_used_gb']:.2f}/{sysinfo['ram_total_gb']:.2f} GB   "
-            f"💾 DISK: {sysinfo['disk_used_gb']:.1f}/{sysinfo['disk_total_gb']:.1f} GB\n"
-            f"⏱️  Uptime: {sysinfo['uptime']}\n"
-        )
-        self.query_one("#stats", Static).update(stats)
-
-        # Hints
-        hint = (
-            "Hotkeys: [A] Add  [D] Delete  [S] Sync  [R] Reload  [L] Logger  [Q] Quit\n"
-            "Dica: ramal 0 chama a Portaria (PJSIP/1000)."
-        )
-        self.query_one("#hint", Static).update(hint)
-
-        # Render users table
-        ut = self.query_one("#users_table", DataTable)
-        ut.clear()
-        for u in sorted(users, key=lambda x: x.ramal):
-            st = endpoint_status.get(u.ramal, {})
-            online = st.get("online", False)
-            status_txt = "ON" if online else "OFF"
-            rtt = st.get("rtt", "")
-            loc = f"Bl {u.bloco} Ap {u.ap}"
-            ut.add_row(u.ramal, loc, u.nome, status_txt, rtt)
-
-        # Render calls table
-        ct = self.query_one("#calls_table", DataTable)
-        ct.clear()
-
-        # Ativas
-        if active_calls:
-            for c in active_calls[:12]:
-                ct.add_row("ATIVA", c.get("callerid", ""), c.get("exten", ""), c.get("state", ""), c.get("app", ""))
+        if ap.strategy == "parallel":
+            targets = "&".join([f"PJSIP/{r.sip}" for r in residents])
+            e_lines.append(f" same => n,Dial({targets},{ap.ring_seconds})\n"
+                           f" same => n,GotoIf($[\"${{DIALSTATUS}}\"=\"ANSWER\"]?done)\n")
         else:
-            ct.add_row("ATIVA", "-", "-", "-", "-")
+            # sequential default
+            per = max(5, int(ap.ring_seconds / max(1, len(residents))))
+            for r in residents:
+                e_lines.append(f" same => n,Dial(PJSIP/{r.sip},{per})\n"
+                               f" same => n,GotoIf($[\"${{DIALSTATUS}}\"=\"ANSWER\"]?done)\n")
 
-        # Últimas do CDR
-        if recent_cdr:
-            for c in recent_cdr[:8]:
-                ct.add_row("CDR", c.get("src", ""), c.get("dst", ""), c.get("disp", ""), f"{c.get('billsec','0')}s")
-        else:
-            ct.add_row("CDR", "-", "-", "-", "-")
+        # WhatsApp fallback placeholder
+        e_lines.append(" same => n,NoOp(FALLBACK_WHATSAPP: (placeholder) aqui entra Evolution API)\n"
+                       " same => n,Playback(vm-nobodyavail)\n"
+                       " same => n(done),Hangup()\n")
 
-        # Logs
-        logw = self.query_one("#log", RichLog)
-        logw.clear()
-        for l in logs:
-            logw.write(l)
+    # Write files
+    os.makedirs(os.path.dirname(P_USERS), exist_ok=True)
+    with open(P_USERS, "w", encoding="utf-8") as f:
+        f.write("\n".join(p_lines).strip() + "\n")
 
+    with open(E_USERS, "w", encoding="utf-8") as f:
+        f.write("\n".join(e_lines).strip() + "\n")
+
+    # Permissions
+    try:
+        sh(["chown", "root:asterisk", P_USERS, E_USERS])
+        sh(["chmod", "640", P_USERS, E_USERS])
+    except Exception:
+        pass
+
+    # Reload asterisk
+    sh(["systemctl", "restart", "asterisk"])
+    asterisk_rx("core reload")
+
+# -----------------------------
+# UI
+# -----------------------------
+def header() -> Panel:
+    ast = "[green]ONLINE[/green]" if asterisk_ok() else "[red]OFFLINE[/red]"
+    info = f"[bold]ASTERISK:[/bold] {ast}    [bold]RAM:[/bold] {ram_pretty()}    [bold]UPTIME:[/bold] {uptime_pretty()}"
+    return Panel(info, title="[bold cyan]INTERFONE TACTICAL[/bold cyan]", border_style="cyan")
+
+def dashboard_table(db: Dict) -> Table:
+    aps = list_apartments(db)
+    contacts = get_contact_status_map() if asterisk_ok() else {}
+    busy = get_busy_set() if asterisk_ok() else set()
+
+    t = Table(box=box.SIMPLE_HEAVY)
+    t.add_column("AP / EXT", style="bold")
+    t.add_column("Estratégia")
+    t.add_column("Moradores", justify="right")
+    t.add_column("Online", justify="right")
+    t.add_column("Busy", justify="right")
+    t.add_column("Detalhe")
+
+    for ap in aps:
+        residents = sorted(ap.residents, key=lambda r: (r.priority, r.name.lower()))
+        total = len(residents)
+        online = 0
+        busy_count = 0
+
+        detail_bits = []
+        for r in residents:
+            st = contacts.get(r.sip, "—")
+            is_on = (st.lower() == "avail")
+            if is_on:
+                online += 1
+            is_busy = (r.sip in busy)
+            if is_busy:
+                busy_count += 1
+
+            tag = "🟢" if is_on else "⚫"
+            tag += "🔴" if is_busy else ""
+            detail_bits.append(f"{tag}{r.name}:{r.sip}")
+
+        det = " | ".join(detail_bits) if detail_bits else "—"
+        t.add_row(f"{ap.label} / {ap.dial_ext}",
+                  ap.strategy,
+                  str(total),
+                  f"[green]{online}[/green]" if online else "0",
+                  f"[red]{busy_count}[/red]" if busy_count else "0",
+                  det)
+    return t
+
+def prompt(msg: str) -> str:
+    return C.input(f"[cyan]{msg}[/cyan] ").strip()
+
+def add_apartment(db: Dict) -> None:
+    C.print(header())
+    dial_ext = prompt("Número do AP (EXT que a portaria disca) (ex: 101)")
+    bloco = prompt("Bloco/Torre (ex: A)")
+    apnum = prompt("Apartamento (ex: 101)")
+    label = f"Bloco {bloco} Ap {apnum}"
+    strategy = prompt("Estratégia [sequential/parallel] (padrão sequential)") or "sequential"
+    ring = prompt("Ring total em segundos (padrão 20)") or "20"
+    ap_id = f"{bloco}-{apnum}"
+
+    db["apartments"].append({
+        "id": ap_id,
+        "label": label,
+        "dial_ext": dial_ext,
+        "strategy": "parallel" if strategy.lower().startswith("p") else "sequential",
+        "ring_seconds": int(ring),
+        "residents": []
+    })
+    save_db(db)
+    C.print("[green]AP criado.[/green]")
+
+def add_resident(db: Dict) -> None:
+    C.print(header())
+    ap_key = prompt("Informe o AP (id 'A-101' ou EXT '101')")
+    ap = find_apartment(db, ap_key)
+    if not ap:
+        C.print("[red]AP não encontrado.[/red]")
+        return
+
+    name = prompt("Nome do morador")
+    sip = prompt("SIP do morador (único) (ex: 1011). Enter = auto") or ""
+    if not sip:
+        # auto: dial_ext + índice
+        base = ap["dial_ext"]
+        used = {r["sip"] for r in ap.get("residents", [])}
+        for i in range(1, 100):
+            cand = f"{base}{i}"
+            if cand not in used:
+                sip = cand
+                break
+
+    password = prompt("Senha SIP (Enter = gerar)") or gen_pass()
+    pr = prompt("Prioridade (menor toca antes) (padrão 10)") or "10"
+
+    ap.setdefault("residents", []).append({
+        "id": secrets.token_hex(6),
+        "name": name,
+        "sip": sip,
+        "password": password,
+        "priority": int(pr),
+        "wa_enabled": False,
+        "wa_number_enc": None
+    })
+
+    save_db(db)
+    C.print(f"[green]Morador criado:[/green] {name} | SIP={sip} | PASS={password}")
+
+def remove_resident(db: Dict) -> None:
+    C.print(header())
+    ap_key = prompt("Informe o AP (id ou EXT)")
+    ap = find_apartment(db, ap_key)
+    if not ap:
+        C.print("[red]AP não encontrado.[/red]")
+        return
+
+    sip = prompt("SIP do morador para remover (ex: 1011)")
+    before = len(ap.get("residents", []))
+    ap["residents"] = [r for r in ap.get("residents", []) if r.get("sip") != sip]
+    after = len(ap.get("residents", []))
+    save_db(db)
+    C.print("[green]Removido.[/green]" if after < before else "[yellow]Nada removido.[/yellow]")
+
+def remove_apartment(db: Dict) -> None:
+    C.print(header())
+    ap_id = prompt("Informe o AP id (ex: A-101) ou EXT (ex: 101)")
+    before = len(db.get("apartments", []))
+    db["apartments"] = [a for a in db.get("apartments", []) if not (a.get("id")==ap_id or a.get("dial_ext")==ap_id)]
+    after = len(db.get("apartments", []))
+    save_db(db)
+    C.print("[green]AP removido.[/green]" if after < before else "[yellow]Nada removido.[/yellow]")
+
+def live_dashboard(db: Dict) -> None:
+    C.print("[bold]CTRL+C[/bold] para sair do modo tático.")
+    with Live(refresh_per_second=1, console=C) as live:
+        while True:
+            db = load_db()
+            layout = Table.grid(expand=True)
+            layout.add_row(header())
+            layout.add_row(dashboard_table(db))
+            live.update(layout)
+            time.sleep(1)
+
+def tail_logs() -> None:
+    C.print("[bold]CTRL+C[/bold] para sair do monitor.")
+    p = subprocess.Popen(["tail", "-f", "/var/log/asterisk/messages"], text=True)
+    try:
+        p.wait()
+    except KeyboardInterrupt:
+        p.terminate()
+
+def menu():
+    ensure_root()
+    while True:
+        db = load_db()
+        C.clear()
+        C.print(header())
+        C.print("\n[bold]1)[/bold] Dashboard tático (live)")
+        C.print("[bold]2)[/bold] Criar AP (unidade)")
+        C.print("[bold]3)[/bold] Criar morador (SIP por pessoa)")
+        C.print("[bold]4)[/bold] Remover morador")
+        C.print("[bold]5)[/bold] Remover AP")
+        C.print("[bold]6)[/bold] Sincronizar Asterisk (gera configs + reload)")
+        C.print("[bold]7)[/bold] Monitor logs Asterisk (tail -f)")
+        C.print("[bold]8)[/bold] Console Asterisk (asterisk -rvvvvv)")
+        C.print("[bold]0)[/bold] Sair\n")
+
+        op = prompt("Seleção")
+        if op == "1":
+            try:
+                live_dashboard(db)
+            except KeyboardInterrupt:
+                pass
+        elif op == "2":
+            add_apartment(db)
+            time.sleep(1)
+        elif op == "3":
+            add_resident(db)
+            time.sleep(2)
+        elif op == "4":
+            remove_resident(db)
+            time.sleep(1)
+        elif op == "5":
+            remove_apartment(db)
+            time.sleep(1)
+        elif op == "6":
+            sync_asterisk(db)
+            C.print("[green]Sincronizado e Asterisk recarregado.[/green]")
+            time.sleep(1)
+        elif op == "7":
+            tail_logs()
+        elif op == "8":
+            os.system("asterisk -rvvvvv")
+        elif op == "0":
+            break
 
 if __name__ == "__main__":
-    InterfoneTactical().run()
+    menu()
