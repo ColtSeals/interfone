@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ==========================================
-# INTERFONE - SUPER MENU (SIP CORE)
-# Painel operacional rico e bonito
-# - Dashboard automático ao abrir (instalado/rodando/online/calls/UFW)
-# - Overview por AP (online/offline/busy)
-# - CRUD AP/Morador/Nomes + Reset senha (gera no apply)
-# - Apply configs, restart, logs, monitor mode
-# ==========================================
-
 APP_DIR="/opt/interfone"
 CFG="$APP_DIR/condo.json"
 SECRETS="/root/interfone-secrets.json"
@@ -17,11 +8,9 @@ INTEG_TXT="/root/interfone-integrations.txt"
 INSTALL_LOG="/root/interfone-install.log"
 ASTERISK_LOG="/var/log/asterisk/messages"
 
-# UI
 USE_COLOR="${USE_COLOR:-1}"
 REFRESH_SLEEP="${REFRESH_SLEEP:-2}"
 
-# ---------- helpers ----------
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || exec sudo bash "$0" "$@"; }
 pause(){ read -r -p "ENTER para continuar..." _; }
 have(){ command -v "$1" >/dev/null 2>&1; }
@@ -52,47 +41,19 @@ title_box(){
   printf "${B}${C}╚%s╝${D}\n" "$(printf '═%.0s' {1..76})"
 }
 
-# ---------- state probes ----------
-asterisk_installed(){
-  have asterisk
-}
+asterisk_installed(){ have asterisk; }
+asterisk_service_exists(){ systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "asterisk.service"; }
+asterisk_active(){ systemctl is-active --quiet asterisk 2>/dev/null; }
+asterisk_enabled(){ systemctl is-enabled --quiet asterisk 2>/dev/null; }
 
-asterisk_service_exists(){
-  systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "asterisk.service"
-}
-
-asterisk_active(){
-  systemctl is-active --quiet asterisk 2>/dev/null
-}
-
-asterisk_enabled(){
-  systemctl is-enabled --quiet asterisk 2>/dev/null
-}
-
-ufw_active(){
-  have ufw && ufw status 2>/dev/null | head -n1 | grep -qi "Status: active"
-}
-
-ufw_has_rule(){
-  local rule="$1"
-  have ufw || return 1
-  ufw status 2>/dev/null | grep -Fqi "$rule"
-}
+ufw_active(){ have ufw && ufw status 2>/dev/null | head -n1 | grep -qi "Status: active"; }
+ufw_has_rule(){ local rule="$1"; have ufw || return 1; ufw status 2>/dev/null | grep -Fqi "$rule"; }
 
 get_public_ip(){
   local ip=""
   ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n1 || true)"
   [[ -z "${ip:-}" ]] && ip="$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 || true)"
   echo "${ip:-N/A}"
-}
-
-safe_json_exists(){
-  [[ -f "$CFG" ]] || return 1
-  have python3 || return 1
-  python3 - <<PY >/dev/null 2>&1
-import json
-json.load(open("${CFG}","r",encoding="utf-8"))
-PY
 }
 
 ensure_cfg_exists(){
@@ -113,45 +74,46 @@ JSON
   fi
 }
 
-# ---------- Asterisk stats (only when active) ----------
-ast_rx(){
-  # safe wrapper
-  asterisk -rx "$1" 2>/dev/null || true
+safe_json_exists(){
+  [[ -f "$CFG" ]] || return 1
+  have python3 || return 1
+  python3 - <<PY >/dev/null 2>&1
+import json
+json.load(open("${CFG}","r",encoding="utf-8"))
+PY
+}
+
+ast_rx(){ asterisk -rx "$1" 2>/dev/null || true; }
+
+# parsers mais robustos (evita "Endpoints=0" bug)
+parse_objects_found(){
+  grep -oE 'Objects found: *[0-9]+' | tail -n1 | grep -oE '[0-9]+' || echo "0"
 }
 
 ast_endpoints_count(){
-  local out
-  out="$(ast_rx "pjsip show endpoints")"
-  echo "$out" | awk -F': ' '/Objects found:/{print $2}' | tail -n1 | tr -d '\r' | awk '{print $1}' | grep -E '^[0-9]+$' || echo "0"
+  ast_rx "pjsip show endpoints" | tr -d '\r' | parse_objects_found
 }
 
 ast_contacts_online_count(){
   local out
-  out="$(ast_rx "pjsip show contacts")"
+  out="$(ast_rx "pjsip show contacts" | tr -d '\r')"
   if echo "$out" | grep -qi "No objects found"; then
     echo "0"
   else
-    echo "$out" | awk -F': ' '/Objects found:/{print $2}' | tail -n1 | tr -d '\r' | awk '{print $1}' | grep -E '^[0-9]+$' || echo "0"
+    echo "$out" | parse_objects_found
   fi
 }
 
 ast_calls_summary(){
-  # returns "calls channels" numbers
   local out calls ch
-  out="$(ast_rx "core show channels count")"
-  # examples:
-  # "2 active channels"
-  # "1 active call"
+  out="$(ast_rx "core show channels count" | tr -d '\r')"
   ch="$(echo "$out" | awk '/active channels/{print $1}' | head -n1 | grep -E '^[0-9]+$' || echo "0")"
   calls="$(echo "$out" | awk '/active call/{print $1}' | head -n1 | grep -E '^[0-9]+$' || echo "0")"
   echo "$calls $ch"
 }
 
 ast_online_ramals(){
-  # prints ramais online, one per line
-  local out
-  out="$(ast_rx "pjsip show contacts")"
-  echo "$out" | awk '
+  ast_rx "pjsip show contacts" | awk '
     /^ *Contact:/{
       x=$2
       sub(/-aor\/.*/,"",x)
@@ -161,12 +123,8 @@ ast_online_ramals(){
 }
 
 ast_busy_ramals(){
-  # prints ramais em chamada, one per line
-  local out
-  out="$(ast_rx "core show channels concise")"
-  echo "$out" | awk -F'!' '
+  ast_rx "core show channels concise" | awk -F'!' '
     {
-      # field1 usually: PJSIP/10101-00000001
       c=$1
       if (c ~ /^PJSIP\//) {
         sub(/^PJSIP\//,"",c)
@@ -177,29 +135,7 @@ ast_busy_ramals(){
     }' | sort -u
 }
 
-# ---------- JSON operations ----------
-py(){
-  python3 - "$@"
-}
-
-list_condo(){
-  ensure_cfg_exists
-  py <<PY
-import json
-data=json.load(open("${CFG}","r",encoding="utf-8"))
-p=data.get("portaria",{})
-print("PORTARIA:", p.get("ramal","1000"), "-", p.get("nome","PORTARIA"))
-print("")
-for ap in data.get("apartamentos",[]):
-    apn=str(ap.get("numero","?")).strip()
-    apnome=str(ap.get("nome","")).strip()
-    head=f"AP {apn}"
-    if apnome: head += f" - {apnome}"
-    print(head)
-    for m in ap.get("moradores",[]):
-        print("  -", m.get("ramal","?"), "|", m.get("nome",""))
-PY
-}
+py(){ python3 - "$@"; }
 
 list_aps_indexed(){
   ensure_cfg_exists
@@ -237,6 +173,25 @@ for ap in aps:
     if str(ap.get("numero","")).strip() == choice:
         print(choice); sys.exit(0)
 print("")
+PY
+}
+
+list_condo(){
+  ensure_cfg_exists
+  py <<PY
+import json
+data=json.load(open("${CFG}","r",encoding="utf-8"))
+p=data.get("portaria",{})
+print("PORTARIA:", p.get("ramal","1000"), "-", p.get("nome","PORTARIA"))
+print("")
+for ap in data.get("apartamentos",[]):
+    apn=str(ap.get("numero","?")).strip()
+    apnome=str(ap.get("nome","")).strip()
+    head=f"AP {apn}"
+    if apnome: head += f" - {apnome}"
+    print(head)
+    for m in ap.get("moradores",[]):
+        print("  -", m.get("ramal","?"), "|", m.get("nome",""))
 PY
 }
 
@@ -306,7 +261,7 @@ if any(str(m.get("ramal","")).strip()==ramal for m in mor):
 else:
     mor.append({"ramal":ramal,"nome":nome,"senha":""})
     json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
-    print("OK: morador adicionado (senha será gerada ao aplicar).")
+    print("OK: morador adicionado.")
 PY
   chmod 600 "$CFG" || true
 }
@@ -412,6 +367,58 @@ PY
   chmod 600 "$CFG" || true
 }
 
+# ✅ DEFINIR SENHA MANUALMENTE
+# Recomendação: use só caracteres seguros (sem espaço/aspas):
+# letras, números e . _ - @ : + = #
+validate_pass(){
+  local p="$1"
+  [[ ${#p} -ge 6 && ${#p} -le 64 ]] || return 1
+  [[ "$p" =~ ^[A-Za-z0-9._@:+#=\-]+$ ]] || return 1
+  return 0
+}
+
+set_password(){
+  ensure_cfg_exists
+  read -r -p "Ramal (1000 portaria ou morador ex: 10101): " ramal
+  [[ -z "${ramal// }" ]] && { bad "Ramal inválido"; return; }
+
+  local p1 p2
+  echo "Senha (6-64 chars; permitido: A-Z a-z 0-9 . _ - @ : + = #)"
+  read -r -s -p "Nova senha: " p1; echo
+  read -r -s -p "Confirmar: " p2; echo
+  [[ "$p1" == "$p2" ]] || { bad "Confirmação não bate."; return; }
+  validate_pass "$p1" || { bad "Senha inválida (tamanho ou caracteres)."; return; }
+
+  py "$ramal" "$p1" <<PY
+import json, sys
+ramal=sys.argv[1].strip()
+senha=sys.argv[2]
+cfg="${CFG}"
+data=json.load(open(cfg,"r",encoding="utf-8"))
+
+# portaria
+p=data.get("portaria",{})
+if str(p.get("ramal","")).strip()==ramal:
+    p["senha"]=senha
+    data["portaria"]=p
+    json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
+    print("OK: senha da PORTARIA definida. Rode APPLY.")
+    raise SystemExit(0)
+
+# moradores
+for ap in data.get("apartamentos",[]):
+    for m in ap.get("moradores",[]):
+        if str(m.get("ramal","")).strip()==ramal:
+            m["senha"]=senha
+            json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
+            print("OK: senha do morador definida. Rode APPLY.")
+            raise SystemExit(0)
+
+print("Ramal não encontrado.")
+PY
+  chmod 600 "$CFG" || true
+}
+
 reset_senha(){
   ensure_cfg_exists
   read -r -p "Ramal para RESETAR senha (ex: 10101 ou 1000): " ramal
@@ -423,7 +430,6 @@ ramal=sys.argv[1].strip()
 cfg="${CFG}"
 data=json.load(open(cfg,"r",encoding="utf-8"))
 
-# portaria
 p=data.get("portaria",{})
 if str(p.get("ramal","")).strip()==ramal:
     p["senha"]=""
@@ -432,7 +438,6 @@ if str(p.get("ramal","")).strip()==ramal:
     print("OK: senha da portaria será regenerada no APPLY.")
     raise SystemExit(0)
 
-# moradores
 for ap in data.get("apartamentos",[]):
     for m in ap.get("moradores",[]):
         if str(m.get("ramal","")).strip()==ramal:
@@ -472,28 +477,21 @@ PY
   chmod 600 "/root/interfone-export.json" || true
 }
 
-# ---------- operational actions ----------
 apply_configs(){
   [[ -x ./install.sh ]] || { bad "install.sh não encontrado no diretório atual."; return; }
   ok "Aplicando configs + reiniciando Asterisk..."
   bash ./install.sh --apply-only
-  ok "APPLY concluído."
+  ok "APPLY concluído. (Agora o $SECRETS deve existir)"
 }
 
 restart_asterisk(){
-  if ! asterisk_service_exists; then
-    bad "asterisk.service não existe."
-    return
-  fi
+  asterisk_service_exists || { bad "asterisk.service não existe."; return; }
   systemctl restart asterisk
-  systemctl is-active --quiet asterisk && ok "Asterisk reiniciado e ATIVO." || bad "Asterisk não subiu."
+  asterisk_active && ok "Asterisk reiniciado e ATIVO." || bad "Asterisk não subiu."
 }
 
 service_status(){
-  if ! asterisk_service_exists; then
-    bad "asterisk.service não existe."
-    return
-  fi
+  asterisk_service_exists || { bad "asterisk.service não existe."; return; }
   systemctl status asterisk --no-pager -l || true
 }
 
@@ -516,10 +514,7 @@ install_now(){
 }
 
 pjsip_logger_toggle(){
-  if ! asterisk_active; then
-    bad "Asterisk não está ativo."
-    return
-  fi
+  asterisk_active || { bad "Asterisk não está ativo."; return; }
   echo "1) ON  (pjsip set logger on)"
   echo "2) OFF (pjsip set logger off)"
   read -r -p "Escolha: " o
@@ -531,10 +526,7 @@ pjsip_logger_toggle(){
 }
 
 firewall_helper(){
-  if ! have ufw; then
-    warn "ufw não instalado."
-    return
-  fi
+  have ufw || { warn "ufw não instalado."; return; }
   echo "Status atual:"
   ufw status || true
   echo
@@ -562,11 +554,18 @@ firewall_helper(){
   esac
 }
 
-# ---------- dashboard ----------
-badge(){
-  # badge "LABEL" "STATUS" "COLOR"
-  local label="$1" status="$2" col="$3"
-  printf "%b[%s: %s]%b" "${col}${B}" "$label" "$status" "${D}"
+explain_integrations(){
+  echo "${B}AMI${D} (TCP 5038, localhost-only): eventos e comandos (melhor p/ status/online/busy)."
+  echo "  - Laravel no mesmo servidor conecta em 127.0.0.1:5038"
+  echo
+  echo "${B}ARI${D} (HTTP 8088, localhost-only): API REST (controle/consulta)."
+  echo "  - URL = endpoint HTTP do ARI:"
+  echo "    http://127.0.0.1:8088/ari/"
+  echo
+  echo "Teste (na VPS):"
+  echo "  curl -u ari:SENHA http://127.0.0.1:8088/ari/asterisk/info"
+  echo
+  warn "Dica: manter localhost-only é o mais seguro. Se quiser acesso externo depois, a gente faz via túnel SSH."
 }
 
 dashboard(){
@@ -575,13 +574,13 @@ dashboard(){
   local ip srv_inst srv_act srv_en ufw on5060 onrtp
   ip="$(get_public_ip)"
 
-  if asterisk_installed; then srv_inst="INSTALADO"; else srv_inst="NÃO"; fi
-  if asterisk_active; then srv_act="ATIVO"; else srv_act="OFF"; fi
-  if asterisk_enabled; then srv_en="ENABLED"; else srv_en="DISABLED"; fi
+  srv_inst="$(asterisk_installed && echo "INSTALADO" || echo "NÃO")"
+  srv_act="$(asterisk_active && echo "ATIVO" || echo "OFF")"
+  srv_en="$(asterisk_enabled && echo "ENABLED" || echo "DISABLED")"
 
-  if ufw_active; then ufw="ON"; else ufw="OFF"; fi
-  if ufw_has_rule "5060/udp"; then on5060="OK"; else on5060="X"; fi
-  if ufw_has_rule "10000:20000/udp"; then onrtp="OK"; else onrtp="X"; fi
+  ufw="$(ufw_active && echo "ON" || echo "OFF")"
+  on5060="$(ufw_has_rule "5060/udp" && echo "OK" || echo "X")"
+  onrtp="$(ufw_has_rule "10000:20000/udp" && echo "OK" || echo "X")"
 
   local endpoints="—" online="—" calls="—" chans="—"
   if asterisk_active; then
@@ -590,36 +589,22 @@ dashboard(){
     read -r calls chans <<<"$(ast_calls_summary)"
   fi
 
-  # header
+  local secrets_state
+  secrets_state="$([[ -f "$SECRETS" ]] && echo "GERADO" || echo "NÃO")"
+
   clear
   title_box
   printf "${B}${W}IP:${D} %s\n" "$ip"
-
-  # status line (badges)
-  local c_inst c_act c_ufw
-  c_inst="$Y"; [[ "$srv_inst" == "INSTALADO" ]] && c_inst="$G"
-  c_act="$R"; [[ "$srv_act" == "ATIVO" ]] && c_act="$G"
-  c_ufw="$Y"; [[ "$ufw" == "ON" ]] && c_ufw="$G"
-
-  printf "%s  %s  %s  %s  %s\n" \
-    "$(badge "ASTERISK" "$srv_inst" "$c_inst")" \
-    "$(badge "SERVIÇO" "$srv_act" "$c_act")" \
-    "$(badge "BOOT" "$srv_en" "$Y")" \
-    "$(badge "UFW" "$ufw" "$c_ufw")" \
-    "$(badge "PORTAS" "5060:$on5060 RTP:$onrtp" "$Y")"
-
+  echo "[ASTERISK: $srv_inst]  [SERVIÇO: $srv_act]  [BOOT: $srv_en]  [UFW: $ufw]  [PORTAS: 5060:$on5060 RTP:$onrtp]  [SECRETS: $secrets_state]"
   hr
-
-  # metrics
   printf "${B}${C}Resumo:${D} Endpoints=%s  Online=%s  Calls=%s  Channels=%s\n" \
     "${B}${endpoints}${D}" "${B}${online}${D}" "${B}${calls}${D}" "${B}${chans}${D}"
 
-  # per-AP overview (online/offline/busy)
   echo
   printf "${B}${C}Apartamentos (overview):${D}\n"
 
   if ! asterisk_active; then
-    warn "Asterisk OFF — overview por AP exibirá apenas contagem cadastrada."
+    warn "Asterisk OFF — overview por AP exibirá apenas cadastro."
     py <<PY
 import json
 data=json.load(open("${CFG}","r",encoding="utf-8"))
@@ -636,18 +621,13 @@ else:
         print(f"  - {label}: {len(mor)} morador(es)")
 PY
   else
-    # build overview using online/busy sets
     local online_list busy_list
     online_list="$(ast_online_ramals || true)"
     busy_list="$(ast_busy_ramals || true)"
 
-    # pass to python via stdin blocks
     python3 - <<PY
-import json, sys
-
-cfg="${CFG}"
-data=json.load(open(cfg,"r",encoding="utf-8"))
-
+import json
+data=json.load(open("${CFG}","r",encoding="utf-8"))
 online=set([x.strip() for x in """${online_list}""".splitlines() if x.strip()])
 busy=set([x.strip() for x in """${busy_list}""".splitlines() if x.strip()])
 
@@ -664,29 +644,18 @@ else:
         bz=sum(1 for m in mor if str(m.get("ramal","")).strip() in busy)
         label=f"AP {apn}"
         if apnome: label += f" - {apnome}"
-
-        # status simple
-        if bz>0:
-            st="BUSY"
-        elif on>0:
-            st="ONLINE"
-        else:
-            st="OFFLINE"
-
+        st = "BUSY" if bz>0 else ("ONLINE" if on>0 else "OFFLINE")
         print(f"  - {label}: {on}/{total} online | {bz} busy | {st}")
 PY
   fi
 
   hr
-  echo "${B}${W}Atalhos rápidos:${D} [R]efresh  [M]onitor  [S]tatus detalhado  [L]ogs  [Q]uit"
+  echo "${B}${W}Atalhos rápidos:${D} [R]efresh  [M]onitor  [S]tatus  [L]ogs  [Q]uit"
   echo
 }
 
 monitor_mode(){
-  if ! asterisk_active; then
-    bad "Asterisk não está ativo. Saindo do monitor."
-    return
-  fi
+  asterisk_active || { bad "Asterisk não está ativo."; return; }
   while true; do
     dashboard
     echo "${B}${Y}MONITOR MODE${D} — atualizando a cada ${REFRESH_SLEEP}s (Ctrl+C para sair)"
@@ -700,30 +669,30 @@ monitor_mode(){
   done
 }
 
-# ---------- menu ----------
 menu(){
   while true; do
     dashboard
-    echo "${B}1${D}) Ver status detalhado (endpoints/contacts/channels)"
-    echo "${B}2${D}) Listar APs e moradores"
-    echo "${B}3${D}) Adicionar AP"
-    echo "${B}4${D}) Adicionar morador (ramal SIP)"
-    echo "${B}5${D}) Remover morador (por ramal)"
-    echo "${B}6${D}) Aplicar configs + reiniciar Asterisk (APPLY)"
-    echo "${B}7${D}) Mostrar senhas/integrações (server-only)"
-    echo "${B}8${D}) Editar nome PORTARIA"
-    echo "${B}9${D}) Editar nome AP"
-    echo "${B}10${D}) Editar nome MORADOR (por ramal)"
-    echo "${B}11${D}) Resetar senha (gera nova no APPLY)"
-    echo "${B}12${D}) Exportar JSON (sem senhas) p/ integração"
-    echo "${B}13${D}) Restart Asterisk"
-    echo "${B}14${D}) Status do serviço (systemctl)"
-    echo "${B}15${D}) Logs (tail asterisk/messages)"
-    echo "${B}16${D}) PJSIP Logger (on/off)"
-    echo "${B}17${D}) Firewall (UFW)"
-    echo "${B}18${D}) MONITOR MODE (live)"
-    echo "${B}19${D}) Instalar/Atualizar Asterisk (source) + Core"
-    echo "${B}0${D}) Sair"
+    echo "1) Ver status detalhado (endpoints/contacts/channels)"
+    echo "2) Listar APs e moradores"
+    echo "3) Adicionar AP"
+    echo "4) Adicionar morador (ramal SIP)"
+    echo "5) Remover morador (por ramal)"
+    echo "6) Aplicar configs + reiniciar Asterisk (APPLY)"
+    echo "7) Senhas/Integrações (explicação AMI/ARI + testes)"
+    echo "8) Editar nome PORTARIA"
+    echo "9) Editar nome AP"
+    echo "10) Editar nome MORADOR (por ramal)"
+    echo "11) Definir senha manualmente (por ramal)"
+    echo "12) Resetar senha (regenera no APPLY)"
+    echo "13) Exportar JSON (sem senhas) p/ integração"
+    echo "14) Restart Asterisk"
+    echo "15) Status do serviço (systemctl)"
+    echo "16) Logs (tail asterisk/messages)"
+    echo "17) PJSIP Logger (on/off)"
+    echo "18) Firewall (UFW)"
+    echo "19) MONITOR MODE (live)"
+    echo "20) Instalar/Atualizar Asterisk (source) + Core"
+    echo "0) Sair"
     echo
     read -r -p "Escolha: " opt
 
@@ -742,25 +711,32 @@ menu(){
       6) apply_configs; pause ;;
       7)
         echo "${B}Senhas SIP:${D} $SECRETS"
-        [[ -f "$SECRETS" ]] && (sed -n '1,220p' "$SECRETS" | head -n 180) || warn "Ainda não gerado."
+        if [[ -f "$SECRETS" ]]; then
+          sed -n '1,240p' "$SECRETS" | head -n 220
+        else
+          warn "Ainda não gerado. Rode a opção 6 (APPLY) para gerar pjsip.conf/extensions.conf e salvar senhas."
+        fi
         echo
         echo "${B}AMI/ARI:${D} $INTEG_TXT"
         [[ -f "$INTEG_TXT" ]] && cat "$INTEG_TXT" || warn "Ainda não gerado."
+        echo
+        explain_integrations
         pause
         ;;
       8) edit_portaria_name; pause ;;
       9) edit_ap_name; pause ;;
       10) edit_morador_name; pause ;;
-      11) reset_senha; pause ;;
-      12) export_safe; pause ;;
-      13) restart_asterisk; pause ;;
-      14) service_status; pause ;;
-      15) tail_logs; pause ;;
-      16) pjsip_logger_toggle; pause ;;
-      17) firewall_helper; pause ;;
-      18|m) monitor_mode ;;
-      19) install_now; pause ;;
-      r) : ;; # refresh (loop redraw)
+      11) set_password; pause ;;
+      12) reset_senha; pause ;;
+      13) export_safe; pause ;;
+      14) restart_asterisk; pause ;;
+      15) service_status; pause ;;
+      16) tail_logs; pause ;;
+      17) pjsip_logger_toggle; pause ;;
+      18) firewall_helper; pause ;;
+      19|m) monitor_mode ;;
+      20) install_now; pause ;;
+      r) : ;;
       q|0) exit 0 ;;
       *) warn "Opção inválida"; pause ;;
     esac
@@ -769,21 +745,10 @@ menu(){
 
 main(){
   need_root "$@"
-
-  # pré-checks úteis
-  if ! have python3; then
-    warn "python3 não encontrado. Instale com: apt install -y python3"
-    pause
-  fi
+  have python3 || { bad "python3 não encontrado. Instale: apt install -y python3"; exit 1; }
 
   ensure_cfg_exists
-
-  # se JSON quebrado, avisar
-  if ! safe_json_exists; then
-    bad "Seu $CFG está inválido (JSON quebrado). Corrija antes de continuar."
-    echo "Arquivo: $CFG"
-    exit 1
-  fi
+  safe_json_exists || { bad "Seu $CFG está inválido (JSON quebrado). Corrija e tente novamente."; exit 1; }
 
   menu
 }
