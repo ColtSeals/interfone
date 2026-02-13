@@ -1,4 +1,3 @@
-cat > /opt/interfone/interfone.py <<'PY'
 #!/usr/bin/env python3
 import os
 import json
@@ -6,7 +5,7 @@ import time
 import secrets
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Set
 
 from rich.console import Console
 from rich.table import Table
@@ -23,8 +22,8 @@ P_USERS = "/etc/asterisk/pjsip_users.conf"
 E_USERS = "/etc/asterisk/extensions_users.conf"
 
 ASTERISK_BIN = "asterisk"
-
 DEFAULT_TRANSPORT = "transport-udp"
+
 
 # -----------------------------
 # Helpers
@@ -48,8 +47,8 @@ def systemctl_is_active(unit: str) -> bool:
 
 def uptime_pretty() -> str:
     try:
-        # "System uptime: ..."
-        return asterisk_rx("core show uptime").splitlines()[0].strip()
+        line = asterisk_rx("core show uptime").splitlines()
+        return line[0].strip() if line else "—"
     except Exception:
         boot = psutil.boot_time()
         secs = int(time.time() - boot)
@@ -75,6 +74,14 @@ def prompt(msg: str) -> str:
     return C.input(f"[cyan]{msg}[/cyan] ").strip()
 
 
+def gen_pass() -> str:
+    return secrets.token_urlsafe(10)
+
+
+def asterisk_ok() -> bool:
+    return systemctl_is_active("asterisk")
+
+
 # -----------------------------
 # Data model
 # -----------------------------
@@ -86,7 +93,7 @@ class Resident:
     password: str
     priority: int = 10
     wa_enabled: bool = False
-    wa_number_enc: Optional[str] = None  # placeholder (não expõe pra portaria)
+    wa_number_enc: Optional[str] = None
 
 
 @dataclass
@@ -126,14 +133,16 @@ def list_apartments(db: Dict) -> List[Apartment]:
     out: List[Apartment] = []
     for a in db.get("apartments", []):
         rs = [Resident(**r) for r in a.get("residents", [])]
-        out.append(Apartment(
-            id=a["id"],
-            label=a["label"],
-            dial_ext=str(a["dial_ext"]),
-            strategy=a.get("strategy", "sequential"),
-            ring_seconds=int(a.get("ring_seconds", 20)),
-            residents=rs
-        ))
+        out.append(
+            Apartment(
+                id=a["id"],
+                label=a["label"],
+                dial_ext=str(a["dial_ext"]),
+                strategy=a.get("strategy", "sequential"),
+                ring_seconds=int(a.get("ring_seconds", 20)),
+                residents=rs,
+            )
+        )
     return out
 
 
@@ -160,49 +169,44 @@ def find_apartment(db: Dict, ap_id_or_ext: str) -> Optional[Dict]:
     return None
 
 
-def gen_pass() -> str:
-    return secrets.token_urlsafe(10)
+def all_sips(db: Dict) -> Set[str]:
+    s = set()
+    for a in db.get("apartments", []):
+        for r in a.get("residents", []):
+            sip = str(r.get("sip", "")).strip()
+            if sip:
+                s.add(sip)
+    return s
 
 
 # -----------------------------
 # Status (online / busy)
 # -----------------------------
 def get_contact_status_map() -> Dict[str, str]:
-    """
-    sip -> Avail | NonQual | Unknown ...
-    """
     txt = asterisk_rx("pjsip show contacts")
     m: Dict[str, str] = {}
     for line in txt.splitlines():
         line = line.strip()
         if not line.startswith("Contact:"):
             continue
-        # Ex: Contact:  1011/sip:1011@1.2.3.4:5060;ob  Avail  23.123
         parts = line.split()
         if len(parts) < 3:
             continue
         sip = parts[1].split("/")[0]
-        status = parts[2]
+        status = parts[2]  # Avail / NonQual / Unknown ...
         m[sip] = status
     return m
 
 
 def get_busy_set() -> set:
-    """
-    Marca ramais que estão com canal ativo.
-    """
     txt = asterisk_rx("core show channels concise")
     busy = set()
     for line in txt.splitlines():
         if line.startswith("PJSIP/"):
-            ch = line.split("!")[0]               # PJSIP/1011-0000000a
-            ext = ch.split("/")[1].split("-")[0]  # 1011
+            ch = line.split("!")[0]
+            ext = ch.split("/")[1].split("-")[0]
             busy.add(ext)
     return busy
-
-
-def asterisk_ok() -> bool:
-    return systemctl_is_active("asterisk")
 
 
 # -----------------------------
@@ -217,7 +221,7 @@ def sync_asterisk(db: Dict) -> None:
     for ap in aps:
         residents = sorted(ap.residents, key=lambda r: (r.priority, r.name.lower()))
 
-        # PJSIP entries
+        # SIP por pessoa
         for r in residents:
             callerid = f"\"{r.name} ({ap.label})\" <{r.sip}>"
 
@@ -228,7 +232,6 @@ def sync_asterisk(db: Dict) -> None:
                 f"username={r.sip}\n"
                 f"password={r.password}\n"
             )
-
             p_lines.append(
                 f"[{r.sip}]\n"
                 f"type=aor\n"
@@ -236,7 +239,6 @@ def sync_asterisk(db: Dict) -> None:
                 f"remove_existing=yes\n"
                 f"qualify_frequency=30\n"
             )
-
             p_lines.append(
                 f"[{r.sip}]\n"
                 f"type=endpoint\n"
@@ -253,14 +255,14 @@ def sync_asterisk(db: Dict) -> None:
                 f"direct_media=no\n"
             )
 
-            # Direct call to resident
+            # discagem direta opcional
             e_lines.append(
                 f"exten => {r.sip},1,NoOp(Chamada direta para {r.name} | {ap.label})\n"
                 f" same => n,Dial(PJSIP/{r.sip},30)\n"
                 f" same => n,Hangup()\n"
             )
 
-        # Apartment virtual extension
+        # EXT do apartamento (portaria disca isso)
         e_lines.append(
             f"; ===============================\n"
             f"; AP: {ap.label} | EXT: {ap.dial_ext} | STRAT: {ap.strategy}\n"
@@ -290,6 +292,7 @@ def sync_asterisk(db: Dict) -> None:
                     f" same => n,GotoIf($[\"${{DIALSTATUS}}\"=\"ANSWER\"]?done)\n"
                 )
 
+        # placeholder WhatsApp/Evolution
         e_lines.append(
             " same => n,NoOp(FALLBACK_WHATSAPP: placeholder - entra Evolution API aqui)\n"
             " same => n,Playback(vm-nobodyavail)\n"
@@ -314,7 +317,7 @@ def sync_asterisk(db: Dict) -> None:
 
 
 # -----------------------------
-# UI components
+# UI
 # -----------------------------
 def header() -> Panel:
     ast = "[green]ONLINE[/green]" if asterisk_ok() else "[red]OFFLINE[/red]"
@@ -330,6 +333,11 @@ def dashboard_table(db: Dict) -> Table:
     aps = apartments_sorted_models(db)
     contacts = get_contact_status_map() if asterisk_ok() else {}
     busy = get_busy_set() if asterisk_ok() else set()
+
+    total_aps = len(aps)
+    total_res = sum(len(a.residents) for a in aps)
+    total_online = 0
+    total_busy = 0
 
     t = Table(box=box.SIMPLE_HEAVY)
     t.add_column("AP / EXT", style="bold")
@@ -351,9 +359,12 @@ def dashboard_table(db: Dict) -> Table:
             is_on = (str(st).lower() == "avail")
             if is_on:
                 online += 1
+                total_online += 1
+
             is_busy = (r.sip in busy)
             if is_busy:
                 busy_count += 1
+                total_busy += 1
 
             tag = "🟢" if is_on else "⚫"
             tag += "🔴" if is_busy else ""
@@ -366,20 +377,14 @@ def dashboard_table(db: Dict) -> Table:
             str(total),
             f"[green]{online}[/green]" if online else "0",
             f"[red]{busy_count}[/red]" if busy_count else "0",
-            det
+            det,
         )
+
+    t.caption = f"APs: {total_aps} | SIPs: {total_res} | Online: {total_online} | Busy: {total_busy}"
     return t
 
 
-def select_apartment_ui(db: Dict, title: str = "Selecione um AP") -> Optional[Dict]:
-    """
-    Lista APs numerados 1..N e retorna o dict do AP escolhido.
-    Aceita:
-      - número da lista (ex: 3)
-      - ou EXT direto (ex: 101)
-      - ou id (ex: A-101)
-      - Enter para cancelar
-    """
+def select_apartment_ui(db: Dict, title: str) -> Optional[Dict]:
     aps = apartments_sorted_dicts(db)
     if not aps:
         C.print("[yellow]Nenhum AP cadastrado.[/yellow]")
@@ -399,27 +404,24 @@ def select_apartment_ui(db: Dict, title: str = "Selecione um AP") -> Optional[Di
     for idx, ap in enumerate(aps, start=1):
         residents = ap.get("residents", [])
         total = len(residents)
-
         online = 0
         busy_count = 0
+
         for r in residents:
-            sip = r.get("sip")
+            sip = str(r.get("sip", "")).strip()
             st = contacts.get(sip, "—")
             if str(st).lower() == "avail":
                 online += 1
             if sip in busy:
                 busy_count += 1
 
-        online_txt = f"[green]{online}[/green]" if online else "0"
-        busy_txt = f"[red]{busy_count}[/red]" if busy_count else "0"
-
         t.add_row(
             str(idx),
             f"{ap.get('label','—')} / {ap.get('dial_ext','—')}",
             ap.get("strategy", "sequential"),
             str(total),
-            online_txt,
-            busy_txt
+            f"[green]{online}[/green]" if online else "0",
+            f"[red]{busy_count}[/red]" if busy_count else "0",
         )
 
     C.print(t)
@@ -427,25 +429,15 @@ def select_apartment_ui(db: Dict, title: str = "Selecione um AP") -> Optional[Di
     if not choice:
         return None
 
-    # número selecionado
     if choice.isdigit():
         n = int(choice)
         if 1 <= n <= len(aps):
             return aps[n - 1]
-        # Se não bateu no range, tenta tratar como EXT numérico
+        # fallback: talvez seja EXT
         ap = find_apartment(db, choice)
-        if ap:
-            return ap
-        C.print("[red]Seleção inválida.[/red]")
-        return None
-
-    # id / ext como string
-    ap = find_apartment(db, choice.strip())
-    if ap:
         return ap
 
-    C.print("[red]AP não encontrado.[/red]")
-    return None
+    return find_apartment(db, choice.strip())
 
 
 # -----------------------------
@@ -457,23 +449,25 @@ def add_apartment(db: Dict) -> None:
     bloco = prompt("Bloco/Torre (ex: A)")
     apnum = prompt("Apartamento (ex: 101)")
     label = f"Bloco {bloco} Ap {apnum}"
+
     strategy = (prompt("Estratégia [sequential/parallel] (padrão sequential)") or "sequential").lower()
     ring = prompt("Ring total em segundos (padrão 20)") or "20"
-    ap_id = f"{bloco}-{apnum}"
 
-    # evita duplicar EXT
-    if find_apartment(db, dial_ext) is not None:
+    if find_apartment(db, str(dial_ext)) is not None:
         C.print("[red]Já existe um AP com esse EXT.[/red]")
         return
 
-    db["apartments"].append({
-        "id": ap_id,
-        "label": label,
-        "dial_ext": str(dial_ext),
-        "strategy": "parallel" if strategy.startswith("p") else "sequential",
-        "ring_seconds": int(ring),
-        "residents": []
-    })
+    ap_id = f"{bloco}-{apnum}"
+    db["apartments"].append(
+        {
+            "id": ap_id,
+            "label": label,
+            "dial_ext": str(dial_ext),
+            "strategy": "parallel" if strategy.startswith("p") else "sequential",
+            "ring_seconds": int(ring),
+            "residents": [],
+        }
+    )
     save_db(db)
     C.print("[green]AP criado.[/green]")
 
@@ -486,27 +480,41 @@ def add_resident(db: Dict) -> None:
 
     name = prompt("Nome do morador")
     sip = prompt("SIP do morador (único) (ex: 1011). Enter = auto") or ""
+
+    used_global = all_sips(db)
+
     if not sip:
         base = str(ap["dial_ext"])
-        used = {r["sip"] for r in ap.get("residents", [])}
+        used_local = {str(r.get("sip")) for r in ap.get("residents", [])}
         for i in range(1, 100):
             cand = f"{base}{i}"
-            if cand not in used:
+            if cand not in used_local and cand not in used_global:
                 sip = cand
                 break
+
+    sip = sip.strip()
+    if not sip:
+        C.print("[red]Falha ao gerar SIP automático.[/red]")
+        return
+
+    if sip in used_global:
+        C.print("[red]Esse SIP já existe em outro AP.[/red]")
+        return
 
     password = prompt("Senha SIP (Enter = gerar)") or gen_pass()
     pr = prompt("Prioridade (menor toca antes) (padrão 10)") or "10"
 
-    ap.setdefault("residents", []).append({
-        "id": secrets.token_hex(6),
-        "name": name,
-        "sip": sip,
-        "password": password,
-        "priority": int(pr),
-        "wa_enabled": False,
-        "wa_number_enc": None
-    })
+    ap.setdefault("residents", []).append(
+        {
+            "id": secrets.token_hex(6),
+            "name": name,
+            "sip": sip,
+            "password": password,
+            "priority": int(pr),
+            "wa_enabled": False,
+            "wa_number_enc": None,
+        }
+    )
 
     save_db(db)
     C.print(f"[green]Morador criado:[/green] {name} | SIP={sip} | PASS={password}")
@@ -570,7 +578,7 @@ def remove_apartment(db: Dict) -> None:
     db["apartments"] = [a for a in db.get("apartments", []) if a.get("id") != ap.get("id")]
     after = len(db.get("apartments", []))
     save_db(db)
-    C.print("[green]AP removido.[green]" if after < before else "[yellow]Nada removido.[/yellow]")
+    C.print("[green]AP removido.[/green]" if after < before else "[yellow]Nada removido.[/yellow]")
 
 
 def live_dashboard(db: Dict) -> None:
@@ -642,7 +650,3 @@ def menu():
 
 if __name__ == "__main__":
     menu()
-PY
-
-chmod +x /opt/interfone/interfone.py
-interfone
