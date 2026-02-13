@@ -73,10 +73,10 @@ O Asterisk usa o dialplan gerado para chamar os moradores conforme a estratégia
 
 ### Instalar a partir do GitHub
 ```bash
-apt update -y && apt install git -y
-rm -rf interfone
+apt update -y && apt install -y git
 git clone https://github.com/ColtSeals/interfone.git
 cd interfone
 chmod +x setup.sh
 ./setup.sh
 interfone
+
