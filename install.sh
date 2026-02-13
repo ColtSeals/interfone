@@ -133,7 +133,6 @@ ensure_asterisk_user(){
   getent group asterisk >/dev/null || addgroup --system asterisk
   id asterisk >/dev/null 2>&1 || adduser --system --ingroup asterisk --home /var/lib/asterisk --no-create-home --disabled-login asterisk
 
-  # diretórios críticos
   install -d -o asterisk -g asterisk /var/lib/asterisk /var/log/asterisk /var/spool/asterisk /var/run/asterisk || true
   chown -R asterisk:asterisk /var/lib/asterisk /var/log/asterisk /var/spool/asterisk /var/run/asterisk 2>/dev/null || true
 }
@@ -174,12 +173,10 @@ build_asterisk_from_source(){
   [[ -n "${dir:-}" ]] || die "Não achei pasta asterisk-* após extrair."
   cd "$dir"
 
-  # tenta instalar prereqs do próprio Asterisk (se falhar, segue com o que já instalamos)
   yes | contrib/scripts/install_prereq install >/dev/null 2>&1 || warn "install_prereq falhou; seguindo com deps do apt."
 
   ./configure
 
-  # evita BUILD_NATIVE (VPS virtual às vezes gera binário que não roda)
   if [[ -x menuselect/menuselect ]]; then
     menuselect/menuselect --disable BUILD_NATIVE menuselect.makeopts >/dev/null 2>&1 || true
   fi
@@ -189,7 +186,6 @@ build_asterisk_from_source(){
   make samples || true
   make install-logrotate || true
 
-  # garante binário no PATH
   if [[ -x /usr/local/sbin/asterisk && ! -x /usr/sbin/asterisk ]]; then
     ln -sf /usr/local/sbin/asterisk /usr/sbin/asterisk
   fi
@@ -213,7 +209,6 @@ Type=simple
 User=asterisk
 Group=asterisk
 
-# cria /run/asterisk com dono correto
 RuntimeDirectory=asterisk
 RuntimeDirectoryMode=0755
 
@@ -237,14 +232,12 @@ write_static_confs(){
   local ETC="/etc/asterisk"
   install -d "$ETC"
 
-  # RTP range (padrão do projeto)
   cat > "$ETC/rtp.conf" <<'C'
 [general]
 rtpstart=10000
 rtpend=20000
 C
 
-  # modules: limpa poluição e remove legacy
   cat > "$ETC/modules.conf" <<'C'
 [modules]
 autoload=yes
@@ -265,10 +258,8 @@ noload => res_hep_rtcp.so
 noload => res_hep_pjsip.so
 C
 
-  # users.conf deprecated (não usamos)
   [[ -f "$ETC/users.conf" ]] && mv -f "$ETC/users.conf" "$ETC/users.conf.bak" || true
 
-  # AMI/ARI localhost-only
   local AMI_USER AMI_PASS ARI_USER ARI_PASS
   AMI_USER="$(awk '/^  user: /{print $2}' "$INTEG_TXT" | head -n1)"
   AMI_PASS="$(awk '/^  pass: /{print $2}' "$INTEG_TXT" | head -n1)"
@@ -320,7 +311,6 @@ import json, secrets, string, sys, os
 CFG, SECRETS, VPS_IP, ETC = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 def gen_pass(n=16):
-    # seguro e compatível com auth do PJSIP
     a = string.ascii_letters + string.digits + "._-@"
     return "".join(secrets.choice(a) for _ in range(n))
 
@@ -335,7 +325,13 @@ for ap in data.get("apartamentos", []):
         if not str(m.get("senha","")).strip():
             m["senha"] = gen_pass()
 
-# --- PJSIP ---
+# =========================
+# PJSIP
+# - AOR = RAMAL (1001) -> compatível com Linphone
+# - ENDPOINT = ep-<ramal> (ep-1001)
+# - AUTH = auth-<ramal>
+# - identify_by=auth_username (evita pegadinha REGISTER sem user no Request-URI)
+# =========================
 p=[]
 p.append("; INTERFONE - GERADO AUTOMATICAMENTE\n\n")
 
@@ -350,49 +346,99 @@ p.append("local_net=10.0.0.0/8\nlocal_net=172.16.0.0/12\nlocal_net=192.168.0.0/1
 
 p.append("[endpoint-common](!)\n")
 p.append("type=endpoint\n")
+p.append("transport=transport-udp\n")
 p.append("disallow=all\nallow=ulaw,alaw\n")
 p.append("direct_media=no\nrtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\n")
-p.append("timers=yes\nlanguage=pt_BR\n\n")
+p.append("timers=yes\nlanguage=pt_BR\n")
+p.append("identify_by=auth_username\n\n")
 
 p.append("[aor-common](!)\n")
-p.append("type=aor\nmax_contacts=5\nremove_existing=no\nqualify_frequency=30\n\n")
+p.append("type=aor\nmax_contacts=5\nremove_existing=yes\nqualify_frequency=30\n\n")
 
 p.append("[auth-common](!)\n")
 p.append("type=auth\nauth_type=userpass\n\n")
 
-def add_endpoint(ramal, nome, senha, context):
-    aor=f"{ramal}-aor"
-    auth=f"{ramal}-auth"
+def add_user(ramal, nome, senha, context):
+    ramal = str(ramal).strip()
+    if not ramal:
+        return
+
+    aor = ramal                 # AOR = ramal (IMPORTANTE)
+    endpoint = f"ep-{ramal}"     # endpoint interno
+    auth = f"auth-{ramal}"
+
+    # AOR
     p.append(f"[{aor}](aor-common)\n\n")
+
+    # AUTH
     p.append(f"[{auth}](auth-common)\nusername={ramal}\npassword={senha}\n\n")
-    p.append(f"[{ramal}](endpoint-common)\ncontext={context}\nauth={auth}\naors={aor}\ncallerid=\"{nome}\" <{ramal}>\n\n")
 
-add_endpoint(data["portaria"]["ramal"], data["portaria"].get("nome","PORTARIA"), data["portaria"]["senha"], "from-portaria")
+    # ENDPOINT
+    p.append(f"[{endpoint}](endpoint-common)\n")
+    p.append(f"context={context}\n")
+    p.append(f"auth={auth}\n")
+    p.append(f"aors={aor}\n")
+    p.append(f"callerid=\"{nome}\" <{ramal}>\n\n")
 
+# Portaria
+add_user(data["portaria"]["ramal"], data["portaria"].get("nome","PORTARIA"), data["portaria"]["senha"], "from-portaria")
+
+# Moradores
 for ap in data.get("apartamentos", []):
     for m in ap.get("moradores", []):
-        add_endpoint(str(m["ramal"]).strip(), m.get("nome", f"AP{ap.get('numero','')}"), m["senha"], "from-internal")
+        add_user(m.get("ramal",""), m.get("nome", f"AP{ap.get('numero','')}"), m.get("senha",""), "from-internal")
 
 open(os.path.join(ETC, "pjsip.conf"), "w", encoding="utf-8").write("".join(p))
 
-# --- DIALPLAN ---
+# =========================
+# DIALPLAN
+# - Portaria chama AP (100/101) e toca todos moradores do AP
+# - Moradores chamam portaria discando 1000
+# - Também permite discar diretamente um ramal (1001/10101...)
+# =========================
 e=[]
 e.append("; INTERFONE - GERADO AUTOMATICAMENTE\n\n")
 
 e.append("[from-portaria]\n")
-e.append("exten => _X.,1,NoOp(PORTARIA chamando ${EXTEN})\n")
-e.append(" same => n,Goto(apartments,${EXTEN},1)\n\n")
+e.append("exten => _X.,1,Goto(route,${EXTEN},1)\n\n")
 
 e.append("[from-internal]\n")
-e.append("exten => 1000,1,NoOp(MORADOR chamando PORTARIA)\n")
-e.append(" same => n,Dial(PJSIP/1000,30)\n")
-e.append(" same => n,Hangup()\n\n")
-e.append("exten => _X.,1,Goto(apartments,${EXTEN},1)\n\n")
+e.append("exten => _X.,1,Goto(route,${EXTEN},1)\n\n")
 
+# Router: tenta AP, depois ramal direto, senão encerra
+e.append("[route]\n")
+e.append("exten => _X.,1,NoOp(ROUTE ${EXTEN})\n")
+e.append(" same => n,GotoIf($[${DIALPLAN_EXISTS(apartments,${EXTEN},1)}]?apartments,${EXTEN},1)\n")
+e.append(" same => n,GotoIf($[${DIALPLAN_EXISTS(extens,${EXTEN},1)}]?extens,${EXTEN},1)\n")
+e.append(" same => n,Playback(invalid)\n")
+e.append(" same => n,Hangup()\n\n")
+
+# Ramais diretos
+e.append("[extens]\n")
+
+# Portaria discável também
+port_r = str(data.get("portaria", {}).get("ramal", "1000")).strip() or "1000"
+e.append(f"exten => {port_r},1,NoOp(CHAMANDO PORTARIA)\n")
+e.append(f" same => n,Dial(PJSIP/ep-{port_r},30)\n")
+e.append(" same => n,Hangup()\n\n")
+
+ramais=set()
+for ap in data.get("apartamentos", []):
+    for m in ap.get("moradores", []):
+        r=str(m.get("ramal","")).strip()
+        if r:
+            ramais.add(r)
+
+for r in sorted(ramais):
+    e.append(f"exten => {r},1,NoOp(CHAMANDO RAMAL {r})\n")
+    e.append(f" same => n,Dial(PJSIP/ep-{r},30)\n")
+    e.append(" same => n,Hangup()\n\n")
+
+# Apartamentos: discar AP chama todos moradores
 e.append("[apartments]\n")
 for ap in data.get("apartamentos", []):
     apnum=str(ap.get("numero","")).strip()
-    targets=[f"PJSIP/{str(m.get('ramal','')).strip()}" for m in ap.get("moradores", []) if str(m.get("ramal","")).strip()]
+    targets=[f"PJSIP/ep-{str(m.get('ramal','')).strip()}" for m in ap.get("moradores", []) if str(m.get("ramal","")).strip()]
     dial="&".join(targets)
     e.append(f"exten => {apnum},1,NoOp(AP {apnum} - RingGroup)\n")
     if dial:
@@ -403,7 +449,7 @@ for ap in data.get("apartamentos", []):
 
 open(os.path.join(ETC, "extensions.conf"), "w", encoding="utf-8").write("".join(e))
 
-# salva secrets e também atualiza o cadastro (pra persistir senhas auto-geradas)
+# Persistência
 json.dump(data, open(SECRETS, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 json.dump(data, open(CFG, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 
@@ -430,7 +476,7 @@ dump_failure(){
   echo "==================== DIAGNÓSTICO (FALHA START) ===================="
   systemctl status asterisk --no-pager -l || true
   echo "-------------------------------------------------------------------"
-  journalctl -u asterisk -n 120 --no-pager || true
+  journalctl -u asterisk -n 180 --no-pager || true
   echo "==================================================================="
   echo
 }
@@ -444,13 +490,12 @@ restart_and_wait(){
   systemctl reset-failed asterisk >/dev/null 2>&1 || true
   systemctl restart asterisk || { dump_failure; die "systemctl restart asterisk falhou"; }
 
-  # espera ACTIVE
   local i
-  for i in {1..20}; do
+  for i in {1..30}; do
     if systemctl is-active --quiet asterisk; then
       break
     fi
-    sleep 0.5
+    sleep 0.4
   done
 
   if ! systemctl is-active --quiet asterisk; then
@@ -458,18 +503,16 @@ restart_and_wait(){
     die "Asterisk não ficou ACTIVE."
   fi
 
-  # espera CLI responder (asterisk.ctl pode demorar)
-  for i in {1..20}; do
+  for i in {1..30}; do
     if "${AST_BIN}" -rx "core show version" >/dev/null 2>&1; then
       log "Asterisk OK e respondendo."
       return 0
     fi
-    # tenta como usuário asterisk também (alguns ambientes são chatos)
     if sudo -u asterisk "${AST_BIN}" -rx "core show version" >/dev/null 2>&1; then
       log "Asterisk OK e respondendo (como usuário asterisk)."
       return 0
     fi
-    sleep 0.5
+    sleep 0.4
   done
 
   dump_failure
@@ -487,17 +530,16 @@ main(){
   ensure_seed_config
   ensure_integrations
 
-  # apply-only AGORA é à prova de burrice: instala se faltar
   if [[ "$ONLY_APPLY" -eq 1 ]]; then
-    if ! find_asterisk_bin >/dev/null 2>&1; then
-      warn "Asterisk não encontrado — vou instalar e depois aplicar."
-    else
+    if find_asterisk_bin >/dev/null 2>&1; then
       log "Asterisk encontrado — aplicando configs..."
       write_static_confs
       generate_pjsip_and_dialplan "$VPS_IP"
       restart_and_wait
       log "APPLY finalizado ✅"
       exit 0
+    else
+      warn "Asterisk não encontrado — vou instalar e depois aplicar."
     fi
   fi
 
@@ -506,7 +548,6 @@ main(){
   build_asterisk_from_source
   write_systemd_unit
 
-  # sempre aplica base e configs
   write_static_confs
   generate_pjsip_and_dialplan "$VPS_IP"
   enable_firewall
@@ -521,6 +562,7 @@ main(){
   echo "Testes:"
   echo "  asterisk -rx \"pjsip show endpoints\""
   echo "  asterisk -rx \"pjsip show contacts\""
+  echo "  asterisk -rx \"pjsip show endpoint ep-1001\""
   echo "==================================================================="
 }
 
