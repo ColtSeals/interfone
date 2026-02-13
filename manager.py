@@ -1,118 +1,116 @@
-import os
-import subprocess
-import json
-import time
-from datetime import datetime
+import os, subprocess, json, time, random, string
 
-# Cores para o Dashboard
-VERDE = '\033[92m'
-AMARELO = '\033[93m'
-VERMELHO = '\033[91m'
-AZUL = '\033[94m'
-RESET = '\033[0m'
-NEGRITO = '\033[1m'
+# Cores Operacionais Premium
+V, A, R, AZ, C, M = '\033[92m', '\033[93m', '\033[91m', '\033[94m', '\033[96m', '\033[95m'
+RE, B = '\033[0m', '\033[1m'
 
-PJSIP_USERS = "/etc/asterisk/pjsip_users.conf"
-EXT_USERS = "/etc/asterisk/extensions_users.conf"
-JSON_DB = "usuarios.json"
+P_USERS = "/etc/asterisk/pjsip_users.conf"
+E_USERS = "/etc/asterisk/extensions_users.conf"
+DB_FILE = "condominio.json"
 
-def get_sys_info():
-    uptime = subprocess.getoutput("uptime -p")
-    ram = subprocess.getoutput("free -h | grep Mem | awk '{print $3 \" / \" $2}'")
-    cpu = subprocess.getoutput("top -bn1 | grep 'Cpu(s)' | awk '{print $2}'") + "%"
-    status_ast = subprocess.getoutput("systemctl is-active asterisk")
-    color_ast = VERDE if status_ast == "active" else VERMELHO
-    return uptime, ram, cpu, f"{color_ast}{status_ast}{RESET}"
+def get_sys():
+    upt = subprocess.getoutput("uptime -p").replace("up ", "")
+    ram = subprocess.getoutput("free -h | grep Mem | awk '{print $3 \"/\" $2}'")
+    ast = f"{V}ONLINE{RE}" if "active" in subprocess.getoutput("systemctl is-active asterisk") else f"{R}OFFLINE{RE}"
+    return upt, ram, ast
+
+def carregar_db():
+    if not os.path.exists(DB_FILE): return []
+    try:
+        with open(DB_FILE, 'r') as f: return json.load(f)
+    except: return []
+
+def salvar_db(dados):
+    with open(DB_FILE, 'w') as f: json.dump(dados, f, indent=4)
+    os.chmod(DB_FILE, 0o777)
 
 def sincronizar(dados):
-    buffer_pjsip = ""
-    buffer_ext = ""
+    p, e = [], []
     for u in dados:
-        r, s, n = u['ramal'], u['senha'], u['usuario']
-        buffer_pjsip += f"\n; --- USER: {n} ---\n[{r}-auth]\ntype=auth\nauth_type=userpass\nusername={r}\npassword={s}\n"
-        buffer_pjsip += f"[{r}-aor]\ntype=aor\nmax_contacts=5\nremove_existing=yes\n"
-        buffer_pjsip += f"[{r}]\ntype=endpoint\naors={r}-aor\nauth={r}-auth\ncontext=interfone-ctx\ndisallow=all\nallow=ulaw,alaw,gsm,opus\n"
-        buffer_pjsip += f"rtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\ndirect_media=no\n"
-        buffer_ext += f"exten => {r},1,Dial(PJSIP/{r},30)\n same => n,Hangup()\n"
+        r, s, n = u['ramal'], u['senha'], u['nome']
+        bl, ap = u['bloco'], u['ap']
+        
+        # Identificação Premium (Aparece no visor do telefone)
+        caller_id = f"\"{n} (Bl{bl}-Ap{ap})\" <{r}>"
+        
+        # Configuração PJSIP Unificada
+        p.append(f"[{r}]\ntype=auth\nauth_type=userpass\nusername={r}\npassword={s}")
+        p.append(f"[{r}]\ntype=aor\nmax_contacts=5\nremove_existing=yes\nqualify_frequency=30")
+        p.append(f"[{r}]\ntype=endpoint\ncontext=interfone-ctx\ndisallow=all\nallow=ulaw,alaw,gsm,opus\nauth={r}\naors={r}\ncallerid={caller_id}\ntransport=transport-udp\nrtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\ndirect_media=no\n")
+        
+        # Dialplan com Log de Chamada
+        e.append(f"exten => {r},1,NoOp(Chamada para {n})\n same => n,Dial(PJSIP/{r},30)\n same => n,Hangup()")
     
-    with open(PJSIP_USERS, "w") as f: f.write(buffer_pjsip)
-    with open(EXT_USERS, "w") as f: f.write(buffer_ext)
-    subprocess.run(["asterisk", "-x", "pjsip reload"], stdout=subprocess.DEVNULL)
-    subprocess.run(["asterisk", "-x", "dialplan reload"], stdout=subprocess.DEVNULL)
+    with open(P_USERS, "w") as f: f.write("\n".join(p))
+    with open(E_USERS, "w") as f: f.write("\n".join(e))
+    subprocess.run(["asterisk", "-x", "core reload"], stdout=subprocess.DEVNULL)
+
+def monitor_brutal():
+    os.system('clear')
+    print(f"{M}{B}--- MONITORAMENTO DE TRAFEGO EM TEMPO REAL ---{RE}\n")
+    log = "/var/log/asterisk/messages"
+    proc = subprocess.Popen(["tail", "-f", log], stdout=subprocess.PIPE, text=True)
+    try:
+        for l in proc.stdout:
+            ts = time.strftime("%H:%M:%S")
+            if "Registered" in l: print(f"[{ts}] {V}CONECTADO:{RE} Um morador acabou de entrar.")
+            elif "Unauthorized" in l: print(f"[{ts}] {R}ALERTA:{RE} Tentativa com senha errada.")
+            elif "Dial" in l: print(f"[{ts}] {AZ}CHAMADA:{RE} Existe uma ligação em curso.")
+    except KeyboardInterrupt: proc.terminate()
 
 def header():
     os.system('clear')
-    uptime, ram, cpu, ast = get_sys_info()
-    print(f"{AZUL}╔════════════════════════════════════════════════════════════════╗{RESET}")
-    print(f"{AZUL}║{NEGRITO}          PAINEL OPERACIONAL - INTERFONE VOIP PRIVADO         {RESET}{AZUL}║{RESET}")
-    print(f"{AZUL}╠════════════════════════════════════════════════════════════════╣{RESET}")
-    print(f"{AZUL}║ {RESET}STATUS: {ast}   | RAM: {ram}   | CPU: {cpu}  {AZUL}║{RESET}")
-    print(f"{AZUL}║ {RESET}UPTIME: {uptime:<47} {AZUL}║{RESET}")
-    print(f"{AZUL}╚════════════════════════════════════════════════════════════════╝{RESET}")
-
-def adicionar():
-    header()
-    print(f"{AMARELO}[+] NOVO CADASTRO{RESET}")
-    nome = input("Identificação (ex: Luanque): ").strip()
-    ramal = input("Ramal (4 dígitos sugerido): ").strip()
-    senha = input("Senha (Enter para aleatória): ").strip() or "".join([str(time.time())[-4:]])
-    
-    dados = carregar_banco()
-    dados.append({"ramal": ramal, "usuario": nome, "senha": senha})
-    salvar_banco(dados)
-    sincronizar(dados)
-    print(f"\n{VERDE}✅ USUÁRIO ATIVADO!{RESET}")
-    time.sleep(2)
-
-def listar():
-    header()
-    dados = carregar_banco()
-    print(f"{NEGRITO}{'RAMAL':<10} | {'USUÁRIO':<20} | {'STATUS ASTERISK'}{RESET}")
-    print("-" * 64)
-    for u in dados:
-        # Verifica no Asterisk se o ramal está online
-        check = subprocess.getoutput(f"asterisk -x 'pjsip show endpoint {u['ramal']}' | grep State")
-        status = f"{VERDE}Online{RESET}" if "Not in use" in check else f"{VERMELHO}Offline{RESET}"
-        print(f"{u['ramal']:<10} | {u['usuario']:<20} | {status}")
-    print("-" * 64)
-    input("\n[Pressione Enter para Voltar]")
-
-def carregar_banco():
-    try:
-        with open(JSON_DB, 'r') as f: return json.load(f)
-    except: return []
-
-def salvar_banco(dados):
-    with open(JSON_DB, 'w') as f: json.dump(dados, f, indent=4)
-
-def ver_logs():
-    header()
-    print(f"{AMARELO}[!] LOGS DE CONEXÃO EM TEMPO REAL (Ctrl+C para sair){RESET}\n")
-    try:
-        subprocess.run(["asterisk", "-rvvvvv"])
-    except KeyboardInterrupt:
-        pass
+    upt, ram, ast = get_sys()
+    print(f"{C}╔" + "═"*66 + "╗")
+    print(f"║ {B}SISTEMA DE INTERFONIA INTELIGENTE v6.0{RE}{C} {" "*(25)} ║")
+    print(f"╠" + "═"*66 + "╣")
+    print(f"║ {RE}AST: {ast} | RAM: {ram:<11} | UPT: {upt:<16} {C}║")
+    print(f"╚" + "═"*66 + "╝{RE}")
 
 def menu():
     while True:
         header()
-        print(f" {NEGRITO}1.{RESET} Adicionar Usuário")
-        print(f" {NEGRITO}2.{RESET} Dashboard de Ramais (Status)")
-        print(f" {NEGRITO}3.{RESET} Remover Usuário")
-        print(f" {NEGRITO}4.{RESET} Monitorar Console (Logs)")
-        print(f" {NEGRITO}5.{RESET} Sair")
-        print(f"\n{AZUL}Opção:{RESET} ", end="")
-        op = input()
+        print(f" 1. {B}Cadastrar Morador{RE} (Premium)")
+        print(f" 2. {B}Lista de Unidades{RE} (Dashboard)")
+        print(f" 3. {B}Remover Cadastro{RE}")
+        print(f" 4. {B}Console Asterisk{RE}")
+        print(f" 5. {M}Monitor Brutal{RE}")
+        print(f" 6. Sair")
         
-        if op == '1': adicionar()
-        elif op == '2': listar()
-        elif op == '3':
+        op = input(f"\n{C}Seleção:{RE} ")
+        
+        if op == '1':
             header()
-            r = input("Ramal para Deletar: ")
-            dados = [u for u in carregar_banco() if u['ramal'] != r]
-            salvar_banco(dados); sincronizar(dados)
-        elif op == '4': ver_logs()
-        elif op == '5': break
+            nome = input("Nome do Morador: ")
+            bloco = input("Bloco/Torre: ")
+            ap = input("Apartamento: ")
+            ramal = input("Ramal (Ex: 101): ")
+            senha = input("Senha (Vazio p/ 'coltseals'): ") or "coltseals"
+            
+            db = carregar_db()
+            db.append({"nome": nome, "bloco": bloco, "ap": ap, "ramal": ramal, "senha": senha})
+            salvar_db(db); sincronizar(db)
+            print(f"\n{V}✔ Morador Ativado!{RE}"); time.sleep(1)
+            
+        elif op == '2':
+            header()
+            db = carregar_db()
+            print(f"{B}{'RAMAL':<7} | {'LOCAL':<12} | {'MORADOR':<20} | {'STATUS'}{RE}")
+            print("-" * 64)
+            for u in db:
+                st_raw = subprocess.getoutput(f"asterisk -x 'pjsip show endpoint {u['ramal']}'")
+                st = f"{V}ON{RE}" if "Not in use" in st_raw else f"{R}OFF{RE}"
+                loc = f"Bl {u['bloco']} Ap {u['ap']}"
+                print(f"{u['ramal']:<7} | {loc:<12} | {u['nome']:<20} | {st}")
+            input(f"\n{A}[ Enter para Voltar ]{RE}")
 
-if __name__ == "__main__":
-    menu()
+        elif op == '3':
+            r = input("Ramal para remover: ")
+            db = [u for u in carregar_db() if u['ramal'] != r]
+            salvar_db(db); sincronizar(db)
+            
+        elif op == '4': subprocess.run(["asterisk", "-rvvvvv"])
+        elif op == '5': monitor_brutal()
+        elif op == '6': break
+
+if __name__ == "__main__": menu()
