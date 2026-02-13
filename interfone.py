@@ -1,672 +1,611 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import os
-import json
+import sqlite3
+import subprocess
 import time
 import secrets
-import subprocess
-import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Any
+from typing import List, Optional, Dict, Tuple
 
+import psutil
 from rich.console import Console
 from rich.table import Table
-from rich.live import Live
 from rich.panel import Panel
-from rich import box
-import psutil
-
-C = Console()
+from rich.prompt import Prompt, Confirm
+from rich.live import Live
 
 APP_DIR = "/opt/interfone"
-DB_PATH = f"{APP_DIR}/db.json"
+DATA_DIR = "/opt/interfone/data"
+DB_PATH = os.path.join(DATA_DIR, "interfone.db")
 
-P_USERS = "/etc/asterisk/pjsip_users.conf"
-E_USERS = "/etc/asterisk/extensions_users.conf"
+PJSIP_USERS = "/etc/asterisk/pjsip_users.conf"
+EXT_USERS = "/etc/asterisk/extensions_users.conf"
 
-ASTERISK_BIN = "/usr/sbin/asterisk" if os.path.exists("/usr/sbin/asterisk") else "asterisk"
-DEFAULT_TRANSPORT = "transport-udp"
+DEFAULT_RING_SECONDS = 20
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def sh(cmd: List[str], check: bool = False) -> Tuple[int, str, str]:
-    p = subprocess.run(cmd, capture_output=True, text=True)
-    if check and p.returncode != 0:
-        raise RuntimeError(f"cmd failed: {' '.join(cmd)}\n{p.stderr}")
-    return p.returncode, p.stdout, p.stderr
+console = Console()
 
-def asterisk_rx(command: str) -> str:
-    rc, out, err = sh([ASTERISK_BIN, "-rx", command])
-    return out if out else err
 
-def systemctl_is_active(unit: str) -> bool:
-    rc, out, _ = sh(["systemctl", "is-active", unit])
-    return (rc == 0) and ("active" in out)
-
-def asterisk_ok() -> bool:
-    if systemctl_is_active("asterisk"):
-        return True
-    # fallback: tenta rx
+def sh(cmd: List[str], timeout: int = 10) -> Tuple[int, str]:
+    """Run shell command and return (rc, output)."""
     try:
-        out = asterisk_rx("core show uptime")
-        return "System uptime" in out or "up" in out.lower()
-    except Exception:
-        return False
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip()
+    except Exception as e:
+        return 1, str(e)
 
-def uptime_pretty() -> str:
+
+def asterisk_rx(command: str, timeout: int = 10) -> Tuple[int, str]:
+    return sh(["asterisk", "-rx", command], timeout=timeout)
+
+
+def asterisk_online() -> bool:
+    rc, _ = asterisk_rx("core show version", timeout=5)
+    return rc == 0
+
+
+def uptime_str() -> str:
     try:
-        txt = asterisk_rx("core show uptime").splitlines()
-        return txt[0].strip() if txt else "—"
+        with open("/proc/uptime", "r", encoding="utf-8") as f:
+            sec = float(f.read().split()[0])
+        m, s = divmod(int(sec), 60)
+        h, m = divmod(m, 60)
+        d, h = divmod(h, 24)
+        if d > 0:
+            return f"{d}d {h}h {m}m"
+        if h > 0:
+            return f"{h}h {m}m {s}s"
+        return f"{m}m {s}s"
     except Exception:
-        boot = psutil.boot_time()
-        secs = int(time.time() - boot)
-        h = secs // 3600
-        m = (secs % 3600) // 60
-        s = secs % 60
-        return f"System uptime: {h}h {m}m {s}s"
+        return "N/A"
 
-def ram_pretty() -> str:
+
+def ram_str() -> str:
     vm = psutil.virtual_memory()
-    used = vm.used // (1024**2)
-    total = vm.total // (1024**2)
+    used = int(vm.used / (1024 * 1024))
+    total = int(vm.total / (1024 * 1024))
     return f"{used}MB/{total}MB"
 
-def ensure_root():
-    if os.geteuid() != 0:
-        C.print("[bold red]Rode como root:[/bold red] sudo interfone")
-        raise SystemExit(1)
 
-def gen_pass() -> str:
-    return secrets.token_urlsafe(10)
+def ensure_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS apartments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            ext TEXT NOT NULL UNIQUE,
+            strategy TEXT NOT NULL DEFAULT 'sequential',
+            ring_seconds INTEGER NOT NULL DEFAULT 20,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS residents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ap_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            ext TEXT NOT NULL UNIQUE,
+            secret TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            FOREIGN KEY(ap_id) REFERENCES apartments(id) ON DELETE CASCADE
+        )
+        """)
+        con.commit()
 
-def norm(s: str) -> str:
-    return (s or "").strip()
-
-# -----------------------------
-# Data model
-# -----------------------------
-@dataclass
-class Resident:
-    id: str
-    name: str
-    sip: str
-    password: str
-    priority: int = 10
-    wa_enabled: bool = False
-    wa_number_enc: Optional[str] = None
 
 @dataclass
 class Apartment:
-    id: str
-    label: str
-    dial_ext: str
+    id: int
+    name: str
+    ext: str
     strategy: str
     ring_seconds: int
-    residents: List[Resident]
 
-def _default_db() -> Dict[str, Any]:
-    return {
-        "portaria": {"sip": "1000", "name": "Portaria", "password": gen_pass()},
-        "apartments": []
-    }
 
-def load_db() -> Dict[str, Any]:
-    if not os.path.exists(DB_PATH):
-        return _default_db()
-    try:
-        with open(DB_PATH, "r", encoding="utf-8") as f:
-            db = json.load(f)
-            if "portaria" not in db:
-                db["portaria"] = {"sip": "1000", "name": "Portaria", "password": gen_pass()}
-            if "apartments" not in db:
-                db["apartments"] = []
-            return db
-    except Exception:
-        return _default_db()
+@dataclass
+class Resident:
+    id: int
+    ap_id: int
+    name: str
+    ext: str
+    secret: str
 
-def save_db(db: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    tmp = DB_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(db, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, DB_PATH)
-    os.chmod(DB_PATH, 0o640)
 
-def list_apartments(db: Dict[str, Any]) -> List[Apartment]:
-    out: List[Apartment] = []
-    for a in db.get("apartments", []):
-        rs = [Resident(**r) for r in a.get("residents", [])]
-        out.append(Apartment(
-            id=a["id"],
-            label=a["label"],
-            dial_ext=a["dial_ext"],
-            strategy=a.get("strategy", "sequential"),
-            ring_seconds=int(a.get("ring_seconds", 20)),
-            residents=rs
-        ))
-    return out
+def db() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
 
-def find_apartment(db: Dict[str, Any], ap_key: str) -> Optional[Dict[str, Any]]:
-    ap_key = norm(ap_key)
-    for a in db.get("apartments", []):
-        if a.get("id") == ap_key or a.get("dial_ext") == ap_key:
-            return a
-    return None
 
-def dial_ext_in_use(db: Dict[str, Any], dial_ext: str) -> bool:
-    dial_ext = norm(dial_ext)
-    return any(a.get("dial_ext") == dial_ext for a in db.get("apartments", []))
+def list_apartments() -> List[Apartment]:
+    with db() as con:
+        rows = con.execute("SELECT * FROM apartments ORDER BY CAST(ext AS INTEGER) ASC, ext ASC").fetchall()
+    return [Apartment(int(r["id"]), r["name"], r["ext"], r["strategy"], int(r["ring_seconds"])) for r in rows]
 
-def ap_id_in_use(db: Dict[str, Any], ap_id: str) -> bool:
-    ap_id = norm(ap_id)
-    return any(a.get("id") == ap_id for a in db.get("apartments", []))
 
-# -----------------------------
-# Status (Online / Busy)
-# -----------------------------
-CONTACT_RE = re.compile(r"^Contact:\s+(?P<name>[^/\s]+)/.*?\s+(?P<status>Avail|NonQual|Unknown|Unavail|Reachable|Lagged)\b", re.I)
+def count_residents_by_ap() -> Dict[int, int]:
+    with db() as con:
+        rows = con.execute("SELECT ap_id, COUNT(*) AS c FROM residents GROUP BY ap_id").fetchall()
+    return {int(r["ap_id"]): int(r["c"]) for r in rows}
 
-def get_contact_status_map() -> Dict[str, str]:
-    txt = asterisk_rx("pjsip show contacts")
-    m: Dict[str, str] = {}
-    for line in txt.splitlines():
-        line = line.strip()
-        if not line.startswith("Contact:"):
+
+def list_residents(ap_id: int) -> List[Resident]:
+    with db() as con:
+        rows = con.execute("SELECT * FROM residents WHERE ap_id=? ORDER BY CAST(ext AS INTEGER) ASC, ext ASC", (ap_id,)).fetchall()
+    return [Resident(int(r["id"]), int(r["ap_id"]), r["name"], r["ext"], r["secret"]) for r in rows]
+
+
+def find_ap_by_ext(ext: str) -> Optional[Apartment]:
+    with db() as con:
+        r = con.execute("SELECT * FROM apartments WHERE ext=?", (ext,)).fetchone()
+    if not r:
+        return None
+    return Apartment(int(r["id"]), r["name"], r["ext"], r["strategy"], int(r["ring_seconds"]))
+
+
+def create_ap(name: str, ext: str, strategy: str, ring_seconds: int) -> None:
+    with db() as con:
+        con.execute(
+            "INSERT INTO apartments (name, ext, strategy, ring_seconds) VALUES (?,?,?,?)",
+            (name, ext, strategy, ring_seconds),
+        )
+        con.commit()
+
+
+def remove_ap(ap_id: int) -> None:
+    with db() as con:
+        con.execute("DELETE FROM apartments WHERE id=?", (ap_id,))
+        con.commit()
+
+
+def create_resident(ap_id: int, name: str, ext: str, secret: str) -> None:
+    with db() as con:
+        con.execute(
+            "INSERT INTO residents (ap_id, name, ext, secret) VALUES (?,?,?,?)",
+            (ap_id, name, ext, secret),
+        )
+        con.commit()
+
+
+def remove_resident(resident_id: int) -> None:
+    with db() as con:
+        con.execute("DELETE FROM residents WHERE id=?", (resident_id,))
+        con.commit()
+
+
+def random_secret(length: int = 14) -> str:
+    alphabet = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def parse_contacts() -> Dict[str, str]:
+    """
+    Return map ext -> status string (Avail/Unavail/Unknown)
+    Based on `pjsip show contacts`.
+    """
+    rc, out = asterisk_rx("pjsip show contacts", timeout=10)
+    if rc != 0 or not out:
+        return {}
+    status = {}
+    for line in out.splitlines():
+        # Common format contains:  <AOR/contact> ... Avail/Unavail
+        # Example:  1011/sip:1011@1.2.3.4:5060  Avail  32.123
+        parts = line.strip().split()
+        if not parts:
             continue
-        mm = CONTACT_RE.match(line)
-        if not mm:
-            # fallback simples
-            parts = line.split()
-            if len(parts) >= 3:
-                sip = parts[1].split("/")[0]
-                st = parts[2]
-                m[sip] = st
+        head = parts[0]
+        if "/" not in head:
             continue
-        sip = mm.group("name")
-        st = mm.group("status")
-        m[sip] = st
-    return m
+        aor = head.split("/")[0]
+        # find 'Avail' or 'Unavail' token
+        st = None
+        for tok in parts:
+            if tok in ("Avail", "Unavail", "Unknown"):
+                st = tok
+                break
+        if st:
+            status[aor] = st
+    return status
 
-def get_busy_set() -> set:
-    txt = asterisk_rx("core show channels concise")
-    busy = set()
-    for line in txt.splitlines():
-        if line.startswith("PJSIP/"):
-            ch = line.split("!")[0]  # PJSIP/1011-0000000a
-            ext = ch.split("/")[1].split("-")[0]
-            busy.add(ext)
+
+def parse_busy_channels() -> Dict[str, int]:
+    """
+    Return map ext -> number of active channels involving PJSIP/ext-
+    """
+    rc, out = asterisk_rx("core show channels concise", timeout=10)
+    if rc != 0 or not out:
+        return {}
+    busy = {}
+    for line in out.splitlines():
+        # concise format contains channel name like: PJSIP/1011-0000000a!...
+        if "PJSIP/" not in line:
+            continue
+        ch = line.split("!")[0]
+        if ch.startswith("PJSIP/"):
+            rest = ch[len("PJSIP/"):]
+            ext = rest.split("-")[0]
+            busy[ext] = busy.get(ext, 0) + 1
     return busy
 
-# -----------------------------
-# Asterisk config generation
-# -----------------------------
-def _pjsip_block_auth(sip: str, password: str) -> str:
-    return (
-        f"[{sip}]\n"
-        f"type=auth\n"
-        f"auth_type=userpass\n"
-        f"username={sip}\n"
-        f"password={password}\n"
-    )
 
-def _pjsip_block_aor(sip: str) -> str:
-    return (
-        f"[{sip}]\n"
-        f"type=aor\n"
-        f"max_contacts=5\n"
-        f"remove_existing=yes\n"
-        f"qualify_frequency=30\n"
-    )
+def header_panel() -> Panel:
+    ast = "ONLINE" if asterisk_online() else "OFFLINE"
+    title = "INTERFONE TACTICAL"
+    body = f"ASTERISK: {ast}    RAM: {ram_str()}    UPTIME: {uptime_str()}"
+    return Panel(body, title=title, expand=True)
 
-def _pjsip_block_endpoint(sip: str, callerid: str) -> str:
-    return (
-        f"[{sip}]\n"
-        f"type=endpoint\n"
-        f"context=interfone-ctx\n"
-        f"disallow=all\n"
-        f"allow=ulaw,alaw,gsm,opus\n"
-        f"auth={sip}\n"
-        f"aors={sip}\n"
-        f"callerid={callerid}\n"
-        f"transport={DEFAULT_TRANSPORT}\n"
-        f"rtp_symmetric=yes\n"
-        f"force_rport=yes\n"
-        f"rewrite_contact=yes\n"
-        f"direct_media=no\n"
-    )
 
-def sync_asterisk(db: Dict[str, Any]) -> None:
-    aps = list_apartments(db)
-    portaria = db.get("portaria", {"sip": "1000", "name": "Portaria", "password": gen_pass()})
-    p_sip = str(portaria.get("sip", "1000")).strip() or "1000"
-    p_name = str(portaria.get("name", "Portaria")).strip() or "Portaria"
-    p_pass = str(portaria.get("password", gen_pass())).strip() or gen_pass()
-
-    p_lines: List[str] = []
-    e_lines: List[str] = []
-
-    # -------- Portaria 1000 --------
-    portaria_callerid = f"\"{p_name}\" <{p_sip}>"
-    p_lines.append(_pjsip_block_auth(p_sip, p_pass))
-    p_lines.append(_pjsip_block_aor(p_sip))
-    p_lines.append(_pjsip_block_endpoint(p_sip, portaria_callerid))
-
-    e_lines.append(
-        f"; ===============================\n"
-        f"; PORTARIA ({p_sip})\n"
-        f"; ===============================\n"
-        f"exten => {p_sip},1,NoOp(Chamada direta para Portaria)\n"
-        f" same => n,Dial(PJSIP/{p_sip},30)\n"
-        f" same => n,Hangup()\n"
-    )
-
-    # -------- Apartamentos --------
-    for ap in aps:
-        residents = sorted(ap.residents, key=lambda r: (r.priority, r.name.lower()))
-
-        # PJSIP para cada morador
-        for r in residents:
-            callerid = f"\"{r.name} ({ap.label})\" <{r.sip}>"
-            p_lines.append(_pjsip_block_auth(r.sip, r.password))
-            p_lines.append(_pjsip_block_aor(r.sip))
-            p_lines.append(_pjsip_block_endpoint(r.sip, callerid))
-
-            # chamada direta pro morador (opcional)
-            e_lines.append(
-                f"exten => {r.sip},1,NoOp(Chamada direta para {r.name} | {ap.label})\n"
-                f" same => n,Dial(PJSIP/{r.sip},30)\n"
-                f" same => n,Hangup()\n"
-            )
-
-        # ramal do AP (portaria disca ap.dial_ext)
-        e_lines.append(
-            f"; ===============================\n"
-            f"; AP: {ap.label} | EXT: {ap.dial_ext} | STRAT: {ap.strategy}\n"
-            f"; ===============================\n"
-            f"exten => {ap.dial_ext},1,NoOp(PORTARIA -> {ap.label})\n"
-        )
-
-        if not residents:
-            e_lines.append(
-                " same => n,NoOp(SEM MORADORES CADASTRADOS)\n"
-                " same => n,Playback(vm-nobodyavail)\n"
-                " same => n,Hangup()\n"
-            )
-            continue
-
-        if ap.strategy == "parallel":
-            targets = "&".join([f"PJSIP/{r.sip}" for r in residents])
-            e_lines.append(
-                f" same => n,Dial({targets},{ap.ring_seconds})\n"
-                f" same => n,GotoIf($[\"${{DIALSTATUS}}\"=\"ANSWER\"]?done)\n"
-            )
-        else:
-            per = max(5, int(ap.ring_seconds / max(1, len(residents))))
-            for r in residents:
-                e_lines.append(
-                    f" same => n,Dial(PJSIP/{r.sip},{per})\n"
-                    f" same => n,GotoIf($[\"${{DIALSTATUS}}\"=\"ANSWER\"]?done)\n"
-                )
-
-        e_lines.append(
-            " same => n,NoOp(FALLBACK_WHATSAPP: placeholder Evolution API)\n"
-            " same => n,Playback(vm-nobodyavail)\n"
-            " same => n(done),Hangup()\n"
-        )
-
-    os.makedirs(os.path.dirname(P_USERS), exist_ok=True)
-    with open(P_USERS, "w", encoding="utf-8") as f:
-        f.write("\n".join(p_lines).strip() + "\n")
-
-    with open(E_USERS, "w", encoding="utf-8") as f:
-        f.write("\n".join(e_lines).strip() + "\n")
-
-    try:
-        sh(["chown", "root:asterisk", P_USERS, E_USERS])
-        sh(["chmod", "640", P_USERS, E_USERS])
-    except Exception:
-        pass
-
-    # reload asterisk (se falhar, restart)
-    rc, _, _ = sh([ASTERISK_BIN, "-rx", "core reload"])
-    if rc != 0:
-        sh(["systemctl", "restart", "asterisk"])
-
-# -----------------------------
-# UI
-# -----------------------------
-def header(db: Dict[str, Any]) -> Panel:
-    ast = "[green]ONLINE[/green]" if asterisk_ok() else "[red]OFFLINE[/red]"
-    portaria = db.get("portaria", {})
-    info = (
-        f"[bold]ASTERISK:[/bold] {ast}    "
-        f"[bold]RAM:[/bold] {ram_pretty()}    "
-        f"[bold]UPTIME:[/bold] {uptime_pretty()}    "
-        f"[bold]PORTARIA:[/bold] {portaria.get('sip','1000')}"
-    )
-    return Panel(info, title="[bold cyan]INTERFONE TACTICAL[/bold cyan]", border_style="cyan")
-
-def dashboard_table(db: Dict[str, Any]) -> Table:
-    aps = list_apartments(db)
-    contacts = get_contact_status_map() if asterisk_ok() else {}
-    busy = get_busy_set() if asterisk_ok() else set()
-
-    t = Table(box=box.SIMPLE_HEAVY)
-    t.add_column("AP / EXT", style="bold")
-    t.add_column("Estratégia")
-    t.add_column("Moradores", justify="right")
-    t.add_column("Online", justify="right")
-    t.add_column("Busy", justify="right")
-    t.add_column("Detalhe")
-
-    for ap in aps:
-        residents = sorted(ap.residents, key=lambda r: (r.priority, r.name.lower()))
-        total = len(residents)
-        online = 0
-        busy_count = 0
-
-        detail_bits = []
-        for r in residents:
-            st = contacts.get(r.sip, "—")
-            is_on = (str(st).lower() == "avail")
-            if is_on:
-                online += 1
-            is_busy = (r.sip in busy)
-            if is_busy:
-                busy_count += 1
-
-            tag = "🟢" if is_on else "⚫"
-            tag += "🔴" if is_busy else ""
-            detail_bits.append(f"{tag}{r.name}:{r.sip}")
-
-        det = " | ".join(detail_bits) if detail_bits else "—"
-        t.add_row(
-            f"{ap.label} / {ap.dial_ext}",
-            ap.strategy,
-            str(total),
-            f"[green]{online}[/green]" if online else "0",
-            f"[red]{busy_count}[/red]" if busy_count else "0",
-            det
-        )
-    return t
-
-def prompt(msg: str) -> str:
-    return C.input(f"[cyan]{msg}[/cyan] ").strip()
-
-def choose_ap(db: Dict[str, Any], title: str) -> Optional[Dict[str, Any]]:
-    aps = list_apartments(db)
+def choose_ap_interactive() -> Optional[Apartment]:
+    aps = list_apartments()
     if not aps:
-        C.print("[yellow]Nenhum AP cadastrado ainda.[/yellow]")
+        console.print("[yellow]Nenhum AP cadastrado. Crie um AP primeiro.[/yellow]")
         return None
 
-    contacts = get_contact_status_map() if asterisk_ok() else {}
-    busy = get_busy_set() if asterisk_ok() else set()
+    counts = count_residents_by_ap()
+    contacts = parse_contacts()
+    busy = parse_busy_channels()
 
-    C.print(f"\n[bold]{title}[/bold]\n")
-    t = Table(box=box.SIMPLE_HEAVY)
-    t.add_column("#", justify="right", style="bold")
-    t.add_column("AP / EXT", style="bold")
-    t.add_column("Estratégia")
-    t.add_column("Moradores", justify="right")
-    t.add_column("Online", justify="right")
-    t.add_column("Busy", justify="right")
+    table = Table(title="Selecionar AP para adicionar morador", show_lines=False)
+    table.add_column("#", justify="right")
+    table.add_column("AP / EXT", justify="left")
+    table.add_column("Estratégia", justify="left")
+    table.add_column("Moradores", justify="right")
+    table.add_column("Online", justify="right")
+    table.add_column("Busy", justify="right")
 
     for i, ap in enumerate(aps, start=1):
-        residents = sorted(ap.residents, key=lambda r: (r.priority, r.name.lower()))
-        total = len(residents)
-        online = sum(1 for r in residents if str(contacts.get(r.sip, "")).lower() == "avail")
-        busy_count = sum(1 for r in residents if r.sip in busy)
-        t.add_row(
+        res = list_residents(ap.id)
+        online_count = sum(1 for r in res if contacts.get(r.ext) == "Avail")
+        busy_count = sum(1 for r in res if busy.get(r.ext, 0) > 0)
+        table.add_row(
             str(i),
-            f"{ap.label} / {ap.dial_ext}",
+            f"{ap.name} / {ap.ext}",
             ap.strategy,
-            str(total),
-            str(online),
+            str(counts.get(ap.id, 0)),
+            str(online_count),
             str(busy_count),
         )
 
-    C.print(t)
-    ans = prompt("Digite o número (#) ou EXT (ex: 101). Enter cancela")
-    if not ans:
+    console.print(table)
+    console.print("Digite o número (#) ou EXT (ex: 101). Enter cancela")
+
+    ans = Prompt.ask("AP", default="")
+    ans = ans.strip()
+    if ans == "":
         return None
 
+    # number index
     if ans.isdigit():
         idx = int(ans)
         if 1 <= idx <= len(aps):
-            return find_apartment(db, aps[idx-1].dial_ext)
-        # se digitou EXT (ex: 101) e também é número, tenta buscar
-        ap = find_apartment(db, ans)
+            return aps[idx - 1]
+
+    # ext
+    ap = find_ap_by_ext(ans)
+    if ap:
         return ap
 
-    return find_apartment(db, ans)
+    console.print("[red]AP inválido.[/red]")
+    return None
 
-def add_apartment(db: Dict[str, Any]) -> None:
-    C.print(header(db))
-    dial_ext = norm(prompt("EXT do AP (número que a portaria disca) (ex: 101)"))
-    if not dial_ext:
-        C.print("[red]EXT inválida.[/red]")
+
+def generate_pjsip_users() -> str:
+    aps = list_apartments()
+    lines = []
+    lines.append("; =====================================")
+    lines.append("; GERADO PELO INTERFONE TACTICAL")
+    lines.append("; Arquivo: pjsip_users.conf")
+    lines.append("; NÃO EDITE MANUALMENTE")
+    lines.append("; =====================================")
+    lines.append("")
+
+    for ap in aps:
+        residents = list_residents(ap.id)
+        for r in residents:
+            # Repetir [ext] com type diferentes é padrão em pjsip.conf.sample
+            lines += [
+                f"; --- {ap.ext} / {ap.name} :: {r.ext} / {r.name}",
+                f"[{r.ext}]",
+                "type=auth",
+                "auth_type=userpass",
+                f"username={r.ext}",
+                f"password={r.secret}",
+                "",
+                f"[{r.ext}]",
+                "type=aor",
+                "max_contacts=1",
+                "remove_existing=yes",
+                "qualify_frequency=30",
+                "",
+                f"[{r.ext}]",
+                "type=endpoint",
+                "transport=transport-udp",
+                "context=interfone-ctx",
+                "disallow=all",
+                "allow=ulaw,alaw,opus",
+                "direct_media=no",
+                "rtp_symmetric=yes",
+                "force_rport=yes",
+                "rewrite_contact=yes",
+                f"aors={r.ext}",
+                f"auth={r.ext}",
+                f'callerid="{r.name}" <{r.ext}>',
+                "",
+            ]
+    return "\n".join(lines).strip() + "\n"
+
+
+def generate_extensions_users() -> str:
+    aps = list_apartments()
+    lines = []
+    lines.append("; =====================================")
+    lines.append("; GERADO PELO INTERFONE TACTICAL")
+    lines.append("; Arquivo: extensions_users.conf")
+    lines.append("; NÃO EDITE MANUALMENTE")
+    lines.append("; =====================================")
+    lines.append("")
+
+    # Para cada AP: ramal do AP chama a estratégia
+    for ap in aps:
+        residents = list_residents(ap.id)
+
+        lines.append(f"; ===== AP {ap.ext} - {ap.name} (strategy={ap.strategy}) =====")
+        lines.append(f"exten => {ap.ext},1,NoOp(INTERFONE AP {ap.ext} strategy={ap.strategy})")
+
+        if not residents:
+            lines.append(" same => n,Playback(vm-nobodyavail)")
+            lines.append(" same => n,Hangup()")
+            lines.append("")
+            continue
+
+        ring_total = max(5, int(ap.ring_seconds or DEFAULT_RING_SECONDS))
+
+        if ap.strategy == "parallel":
+            targets = "&".join([f"PJSIP/{r.ext}" for r in residents])
+            lines.append(f" same => n,Dial({targets},{ring_total})")
+            lines.append(" same => n,Hangup()")
+            lines.append("")
+        else:
+            # sequential (divide tempo)
+            per = max(5, ring_total // max(1, len(residents)))
+            for idx, r in enumerate(residents, start=1):
+                lines.append(f" same => n,NoOp(Tentativa {idx}/{len(residents)} -> {r.ext} {r.name})")
+                lines.append(f" same => n,Dial(PJSIP/{r.ext},{per})")
+                lines.append(' same => n,GotoIf($["${DIALSTATUS}"="ANSWER"]?done)')
+            lines.append(" same => n,Playback(vm-nobodyavail)")
+            lines.append(" same => n,Hangup()")
+            lines.append(" same => n(done),Hangup()")
+            lines.append("")
+
+    # Ramal direto por morador (opcional, útil)
+    lines.append("; ===== RAMAIS DIRETOS (por morador) =====")
+    for ap in aps:
+        residents = list_residents(ap.id)
+        for r in residents:
+            lines.append(f"exten => {r.ext},1,NoOp(INTERFONE MORADOR {r.ext} ({r.name}) AP {ap.ext})")
+            lines.append(f" same => n,Dial(PJSIP/{r.ext},{max(5, int(ap.ring_seconds or DEFAULT_RING_SECONDS))})")
+            lines.append(" same => n,Hangup()")
+            lines.append("")
+    return "\n".join(lines).strip() + "\n"
+
+
+def sync_asterisk() -> None:
+    pjsip = generate_pjsip_users()
+    ext = generate_extensions_users()
+
+    # escreve arquivos
+    with open(PJSIP_USERS, "w", encoding="utf-8") as f:
+        f.write(pjsip)
+    with open(EXT_USERS, "w", encoding="utf-8") as f:
+        f.write(ext)
+
+    # reload
+    asterisk_rx("pjsip reload", timeout=15)
+    asterisk_rx("dialplan reload", timeout=15)
+    asterisk_rx("core reload", timeout=15)
+
+
+def dashboard_table() -> Table:
+    aps = list_apartments()
+    counts = count_residents_by_ap()
+    contacts = parse_contacts()
+    busy = parse_busy_channels()
+
+    t = Table(title="Dashboard tático (live)")
+    t.add_column("AP / EXT", justify="left")
+    t.add_column("Estratégia", justify="left")
+    t.add_column("Moradores", justify="right")
+    t.add_column("Online", justify="right")
+    t.add_column("Busy", justify="right")
+
+    for ap in aps:
+        res = list_residents(ap.id)
+        online_count = sum(1 for r in res if contacts.get(r.ext) == "Avail")
+        busy_count = sum(1 for r in res if busy.get(r.ext, 0) > 0)
+        t.add_row(
+            f"{ap.name} / {ap.ext}",
+            ap.strategy,
+            str(counts.get(ap.id, 0)),
+            str(online_count),
+            str(busy_count),
+        )
+    return t
+
+
+def dashboard_live():
+    if not asterisk_online():
+        console.print("[red]Asterisk OFFLINE. Verifique: systemctl status asterisk[/red]")
         return
-    if dial_ext_in_use(db, dial_ext):
-        C.print("[red]Essa EXT já está em uso.[/red]")
+
+    console.print("[cyan]Pressione CTRL+C para sair do live.[/cyan]")
+    try:
+        with Live(console=console, refresh_per_second=1) as live:
+            while True:
+                live.update(Panel(dashboard_table(), title="INTERFONE TACTICAL", expand=True))
+                time.sleep(1)
+    except KeyboardInterrupt:
         return
 
-    bloco = norm(prompt("Bloco/Torre (ex: A)")) or "A"
-    apnum = norm(prompt("Apartamento (ex: 101)")) or dial_ext
 
-    label = f"Bloco {bloco.upper()} Ap {apnum}"
-    strategy = (norm(prompt("Estratégia [sequential/parallel] (padrão sequential)")) or "sequential").lower()
-    ring = norm(prompt("Ring total em segundos (padrão 20)")) or "20"
+def create_ap_flow():
+    console.print(Panel(
+        "Estratégias:\n"
+        "- [bold]sequential[/bold]: chama um por um (cascata)\n"
+        "- [bold]parallel[/bold]: chama todos ao mesmo tempo (ringall)\n",
+        title="Criar AP (unidade)"
+    ))
+    name = Prompt.ask("Nome do AP (ex: Bloco A Ap 101)")
+    ext = Prompt.ask("Ramal do AP (ex: 101)").strip()
+    strategy = Prompt.ask("Estratégia", choices=["sequential", "parallel"], default="sequential")
+    ring = int(Prompt.ask("Tempo total de toque (segundos)", default=str(DEFAULT_RING_SECONDS)))
 
-    ap_id = f"{bloco.upper()}-{apnum}"
-    if ap_id_in_use(db, ap_id):
-        C.print("[red]Esse ID de AP já existe.[/red]")
+    if find_ap_by_ext(ext):
+        console.print("[red]Já existe um AP com esse ramal.[/red]")
         return
+    create_ap(name=name, ext=ext, strategy=strategy, ring_seconds=ring)
+    console.print("[green]AP criado![/green]")
 
-    db["apartments"].append({
-        "id": ap_id,
-        "label": label,
-        "dial_ext": dial_ext,
-        "strategy": "parallel" if strategy.startswith("p") else "sequential",
-        "ring_seconds": int(ring),
-        "residents": []
-    })
-    save_db(db)
-    C.print("[green]AP criado.[/green]")
 
-def add_resident(db: Dict[str, Any]) -> None:
-    C.print(header(db))
-    ap = choose_ap(db, "Selecionar AP para adicionar morador")
+def create_resident_flow():
+    ap = choose_ap_interactive()
     if not ap:
         return
 
-    name = norm(prompt("Nome do morador"))
-    if not name:
-        C.print("[red]Nome inválido.[/red]")
+    console.print(Panel(
+        f"AP selecionado: [bold]{ap.name}[/bold] (ramal {ap.ext})\n"
+        "Dica: use ramais por pessoa (ex: 1011, 1012...).",
+        title="Criar morador"
+    ))
+
+    name = Prompt.ask("Nome do morador")
+    ext = Prompt.ask("Ramal SIP do morador (ex: 1011)").strip()
+
+    with db() as con:
+        exists = con.execute("SELECT 1 FROM residents WHERE ext=?", (ext,)).fetchone()
+    if exists:
+        console.print("[red]Esse ramal SIP já existe.[/red]")
         return
 
-    sip = norm(prompt("SIP do morador (único) (ex: 1011). Enter = auto"))
-    if not sip:
-        base = str(ap["dial_ext"])
-        used = {r["sip"] for r in ap.get("residents", [])}
-        for i in range(1, 100):
-            cand = f"{base}{i}"
-            if cand not in used:
-                sip = cand
-                break
+    secret = Prompt.ask("Senha SIP (Enter para gerar)", default="")
+    secret = secret.strip() or random_secret()
 
-    used_global = set()
-    for a in db.get("apartments", []):
-        for r in a.get("residents", []):
-            used_global.add(r.get("sip"))
-    if sip in used_global or sip == str(db.get("portaria", {}).get("sip", "1000")):
-        C.print("[red]SIP já em uso. Escolha outro.[/red]")
-        return
+    create_resident(ap_id=ap.id, name=name, ext=ext, secret=secret)
+    console.print("[green]Morador criado![/green]")
+    console.print(f"[bold]SIP:[/bold] usuário={ext}  senha={secret}")
 
-    password = norm(prompt("Senha SIP (Enter = gerar)")) or gen_pass()
-    pr = norm(prompt("Prioridade (menor toca antes) (padrão 10)")) or "10"
 
-    ap.setdefault("residents", []).append({
-        "id": secrets.token_hex(6),
-        "name": name,
-        "sip": sip,
-        "password": password,
-        "priority": int(pr),
-        "wa_enabled": False,
-        "wa_number_enc": None
-    })
-
-    save_db(db)
-    C.print(f"[green]Morador criado:[/green] {name} | SIP={sip} | PASS={password}")
-
-def remove_resident(db: Dict[str, Any]) -> None:
-    C.print(header(db))
-    ap = choose_ap(db, "Selecionar AP para remover morador")
+def remove_resident_flow():
+    ap = choose_ap_interactive()
     if not ap:
         return
-
-    if not ap.get("residents"):
-        C.print("[yellow]Esse AP não tem moradores.[/yellow]")
+    res = list_residents(ap.id)
+    if not res:
+        console.print("[yellow]Nenhum morador neste AP.[/yellow]")
         return
 
-    t = Table(box=box.SIMPLE_HEAVY)
-    t.add_column("#", justify="right", style="bold")
-    t.add_column("Nome", style="bold")
-    t.add_column("SIP", style="bold")
-    t.add_column("Prioridade", justify="right")
-    residents = sorted(ap.get("residents", []), key=lambda r: (int(r.get("priority", 10)), str(r.get("name", "")).lower()))
-    for i, r in enumerate(residents, start=1):
-        t.add_row(str(i), str(r.get("name")), str(r.get("sip")), str(r.get("priority", 10)))
-    C.print(t)
+    t = Table(title=f"Moradores do AP {ap.ext} - {ap.name}")
+    t.add_column("#", justify="right")
+    t.add_column("Ramal", justify="left")
+    t.add_column("Nome", justify="left")
+    for i, r in enumerate(res, start=1):
+        t.add_row(str(i), r.ext, r.name)
+    console.print(t)
 
-    ans = prompt("Digite o número (#) ou SIP para remover. Enter cancela")
+    ans = Prompt.ask("Remover qual? (# ou ramal). Enter cancela", default="").strip()
     if not ans:
         return
 
-    target_sip = None
+    target: Optional[Resident] = None
     if ans.isdigit():
         idx = int(ans)
-        if 1 <= idx <= len(residents):
-            target_sip = str(residents[idx-1].get("sip"))
-        else:
-            target_sip = ans
+        if 1 <= idx <= len(res):
+            target = res[idx - 1]
     else:
-        target_sip = ans
+        for r in res:
+            if r.ext == ans:
+                target = r
+                break
 
-    before = len(ap.get("residents", []))
-    ap["residents"] = [r for r in ap.get("residents", []) if str(r.get("sip")) != str(target_sip)]
-    after = len(ap.get("residents", []))
-    save_db(db)
-    C.print("[green]Removido.[/green]" if after < before else "[yellow]Nada removido.[/yellow]")
+    if not target:
+        console.print("[red]Seleção inválida.[/red]")
+        return
 
-def remove_apartment(db: Dict[str, Any]) -> None:
-    C.print(header(db))
-    ap = choose_ap(db, "Selecionar AP para remover")
+    if Confirm.ask(f"Confirmar remoção de {target.ext} / {target.name}?"):
+        remove_resident(target.id)
+        console.print("[green]Removido![/green]")
+
+
+def remove_ap_flow():
+    ap = choose_ap_interactive()
     if not ap:
         return
+    if Confirm.ask(f"Remover AP {ap.ext} / {ap.name} (isso remove todos moradores)?"):
+        remove_ap(ap.id)
+        console.print("[green]AP removido![/green]")
 
-    conf = prompt(f"Confirma remover {ap.get('label')} / {ap.get('dial_ext')} ? (digite SIM)")
-    if conf.strip().upper() != "SIM":
-        C.print("[yellow]Cancelado.[/yellow]")
-        return
 
-    ap_id = ap.get("id")
-    before = len(db.get("apartments", []))
-    db["apartments"] = [a for a in db.get("apartments", []) if a.get("id") != ap_id]
-    after = len(db.get("apartments", []))
-    save_db(db)
-    C.print("[green]AP removido.[/green]" if after < before else "[yellow]Nada removido.[/yellow]")
-
-def portaria_settings(db: Dict[str, Any]) -> None:
-    C.print(header(db))
-    p = db.get("portaria", {"sip": "1000", "name": "Portaria", "password": gen_pass()})
-
-    C.print("\n[bold]Portaria (ramal 1000)[/bold]")
-    C.print(f"SIP atual: [bold]{p.get('sip','1000')}[/bold] (recomendado manter 1000)")
-    C.print(f"Nome atual: [bold]{p.get('name','Portaria')}[/bold]")
-
-    name = norm(prompt("Novo nome (Enter mantém)"))
-    if name:
-        p["name"] = name
-
-    passwd = norm(prompt("Nova senha SIP (Enter = gerar nova / vazio mantém?) [G=gerar / Enter mantém]"))
-    # comportamento:
-    # - se usuário digitar "G": gera
-    # - se usuário deixar vazio: mantém
-    # - se digitar algo: usa
-    if passwd.upper() == "G":
-        p["password"] = gen_pass()
-    elif passwd:
-        p["password"] = passwd
-
-    p["sip"] = str(p.get("sip", "1000")).strip() or "1000"
-    db["portaria"] = p
-    save_db(db)
-
-    C.print(f"[green]Portaria atualizada.[/green] SIP={p['sip']} | SENHA={p['password']}")
-
-def live_dashboard() -> None:
-    C.print("[bold]CTRL+C[/bold] para sair do modo tático.")
-    with Live(refresh_per_second=1, console=C) as live:
-        while True:
-            db = load_db()
-            layout = Table.grid(expand=True)
-            layout.add_row(header(db))
-            layout.add_row(dashboard_table(db))
-            live.update(layout)
-            time.sleep(1)
-
-def tail_logs() -> None:
-    C.print("[bold]CTRL+C[/bold] para sair do monitor.")
-    p = subprocess.Popen(["tail", "-f", "/var/log/asterisk/messages"], text=True)
+def monitor_logs():
+    console.print("[cyan]Saindo: CTRL+C[/cyan]")
     try:
-        p.wait()
-    except KeyboardInterrupt:
-        p.terminate()
+        os.execvp("bash", ["bash", "-lc", "tail -f /var/log/asterisk/full"])
+    except Exception as e:
+        console.print(f"[red]Falha ao abrir tail: {e}[/red]")
+
+
+def asterisk_console():
+    try:
+        os.execvp("asterisk", ["asterisk", "-rvvvvv"])
+    except Exception as e:
+        console.print(f"[red]Falha ao abrir console: {e}[/red]")
+
 
 def menu():
-    ensure_root()
-    while True:
-        db = load_db()
-        C.clear()
-        C.print(header(db))
-        C.print("\n[bold]1)[/bold] Dashboard tático (live)")
-        C.print("[bold]2)[/bold] Criar AP (unidade)")
-        C.print("[bold]3)[/bold] Criar morador (SIP por pessoa)")
-        C.print("[bold]4)[/bold] Remover morador")
-        C.print("[bold]5)[/bold] Remover AP")
-        C.print("[bold]6)[/bold] Sincronizar Asterisk (gera configs + reload)")
-        C.print("[bold]7)[/bold] Monitor logs Asterisk (tail -f)")
-        C.print("[bold]8)[/bold] Console Asterisk (asterisk -rvvvvv)")
-        C.print("[bold]9)[/bold] Portaria (ramal 1000) - alterar senha")
-        C.print("[bold]0)[/bold] Sair\n")
+    ensure_db()
 
-        op = prompt("Seleção")
-        if op == "1":
-            try:
-                live_dashboard()
-            except KeyboardInterrupt:
-                pass
-        elif op == "2":
-            add_apartment(db); time.sleep(1)
-        elif op == "3":
-            add_resident(db); time.sleep(2)
-        elif op == "4":
-            remove_resident(db); time.sleep(1)
-        elif op == "5":
-            remove_apartment(db); time.sleep(1)
-        elif op == "6":
-            sync_asterisk(db)
-            C.print("[green]Sincronizado e Asterisk recarregado.[/green]")
-            time.sleep(1)
-        elif op == "7":
-            tail_logs()
-        elif op == "8":
-            os.system("asterisk -rvvvvv")
-        elif op == "9":
-            portaria_settings(db)
-            time.sleep(2)
-        elif op == "0":
-            break
+    while True:
+        console.print(header_panel())
+        console.print("""
+1) Dashboard tático (live)
+2) Criar AP (unidade)
+3) Criar morador (SIP por pessoa)
+4) Remover morador
+5) Remover AP
+6) Sincronizar Asterisk (gera configs + reload)
+7) Monitor logs Asterisk (tail -f)
+8) Console Asterisk (asterisk -rvvvvv)
+0) Sair
+""".strip())
+
+        choice = Prompt.ask("Seleção", choices=[str(i) for i in range(0, 9)], default="1")
+
+        if choice == "0":
+            return
+        if choice == "1":
+            dashboard_live()
+        elif choice == "2":
+            create_ap_flow()
+        elif choice == "3":
+            create_resident_flow()
+        elif choice == "4":
+            remove_resident_flow()
+        elif choice == "5":
+            remove_ap_flow()
+        elif choice == "6":
+            if not asterisk_online():
+                console.print("[red]Asterisk OFFLINE. Verifique: systemctl status asterisk[/red]")
+            else:
+                sync_asterisk()
+                console.print("[green]Sincronizado e recarregado![/green]")
+        elif choice == "7":
+            monitor_logs()
+        elif choice == "8":
+            asterisk_console()
+
 
 if __name__ == "__main__":
     menu()
