@@ -8,7 +8,6 @@ INTEG_TXT="/root/interfone-integrations.txt"
 
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || exec sudo bash "$0" "$@"; }
 pause(){ read -r -p "ENTER para continuar..." _; }
-
 has_asterisk(){ command -v asterisk >/dev/null 2>&1; }
 
 show_status(){
@@ -26,9 +25,6 @@ show_status(){
   asterisk -rx "core show channels concise" || true
 }
 
-# ================
-# Helpers de APs
-# ================
 list_aps_indexed(){
   python3 - <<PY
 import json
@@ -37,49 +33,36 @@ aps=data.get("apartamentos",[])
 if not aps:
     print("(Nenhum AP cadastrado)")
     raise SystemExit(0)
-
 for i, ap in enumerate(aps, 1):
-    n=ap.get("numero","?")
+    n=str(ap.get("numero","?")).strip()
+    nome=str(ap.get("nome", "")).strip()
     q=len(ap.get("moradores",[]))
-    print(f"{i}) AP {n}  ({q} morador(es))")
-PY
-}
-
-get_ap_numbers(){
-  python3 - <<PY
-import json
-data=json.load(open("${CFG}","r",encoding="utf-8"))
-aps=data.get("apartamentos",[])
-print(" ".join([str(a.get("numero","")).strip() for a in aps if str(a.get("numero","")).strip()]))
+    label=f"AP {n}"
+    if nome:
+        label += f" - {nome}"
+    print(f"{i}) {label}  ({q} morador(es))")
 PY
 }
 
 resolve_ap_choice(){
-  # retorna AP number resolvido via stdout
-  # aceita: "804" ou "2" (índice)
   local choice="$1"
   python3 - <<PY
 import json, sys
 choice=sys.argv[1].strip()
 data=json.load(open("${CFG}","r",encoding="utf-8"))
 aps=data.get("apartamentos",[])
-
 if not aps:
-    print("")
-    sys.exit(0)
+    print(""); sys.exit(0)
 
-# se for índice
 if choice.isdigit():
     idx=int(choice)
     if 1 <= idx <= len(aps):
         print(str(aps[idx-1].get("numero","")).strip())
         sys.exit(0)
 
-# senão tenta por número do AP
 for ap in aps:
     if str(ap.get("numero","")).strip() == choice:
-        print(choice)
-        sys.exit(0)
+        print(choice); sys.exit(0)
 
 print("")
 PY "$choice"
@@ -89,10 +72,15 @@ list_condo(){
   python3 - <<PY
 import json
 data=json.load(open("${CFG}","r",encoding="utf-8"))
-print("PORTARIA:", data["portaria"]["ramal"], "-", data["portaria"].get("nome",""))
+p=data.get("portaria",{})
+print("PORTARIA:", p.get("ramal","1000"), "-", p.get("nome","PORTARIA"))
 print("")
 for ap in data.get("apartamentos",[]):
-    print("AP", ap.get("numero","?"))
+    apn=str(ap.get("numero","?")).strip()
+    apnome=str(ap.get("nome","")).strip()
+    head=f"AP {apn}"
+    if apnome: head += f" - {apnome}"
+    print(head)
     for m in ap.get("moradores",[]):
         print("  -", m.get("ramal","?"), "|", m.get("nome",""))
 PY
@@ -105,16 +93,22 @@ add_ap(){
   read -r -p "Número do AP (ex: 804): " apnum
   [[ -z "${apnum// }" ]] && { echo "AP inválido"; return; }
 
+  read -r -p "Nome do AP (opcional, ex: Cobertura / Apto Família): " apname
+
   python3 - <<PY
 import json
 cfg="${CFG}"
 apnum="${apnum}".strip()
+apname="${apname}".strip()
 data=json.load(open(cfg,"r",encoding="utf-8"))
 aps=data.setdefault("apartamentos",[])
 if any(str(a.get("numero","")).strip()==apnum for a in aps):
     print("Já existe.")
 else:
-    aps.append({"numero":apnum,"moradores":[]})
+    obj={"numero":apnum,"moradores":[]}
+    if apname:
+        obj["nome"]=apname
+    aps.append(obj)
     json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
     print("OK: AP criado.")
 PY
@@ -130,14 +124,11 @@ add_morador(){
 
   local apnum
   apnum="$(resolve_ap_choice "${choice:-}")"
-  if [[ -z "${apnum:-}" ]]; then
-    echo "AP inválido ou não existe."
-    return
-  fi
+  [[ -n "${apnum:-}" ]] || { echo "AP inválido ou não existe."; return; }
 
   echo "AP escolhido: $apnum"
   read -r -p "Ramal SIP (ex: ${apnum}01): " ramal
-  read -r -p "Nome (ex: AP${apnum}-01): " nome
+  read -r -p "Nome do morador (ex: João / Maria / AP${apnum}-01): " nome
   [[ -z "${ramal// }" ]] && { echo "Ramal inválido"; return; }
   [[ -z "${nome// }" ]] && nome="AP${apnum}-${ramal}"
 
@@ -147,7 +138,6 @@ cfg="${CFG}"
 apnum="${apnum}".strip()
 ramal="${ramal}".strip()
 nome="${nome}".strip()
-
 data=json.load(open(cfg,"r",encoding="utf-8"))
 aps=data.setdefault("apartamentos",[])
 ap=None
@@ -157,7 +147,6 @@ for a in aps:
 if ap is None:
     print("AP não existe.")
     raise SystemExit(0)
-
 mor=ap.setdefault("moradores",[])
 if any(str(m.get("ramal","")).strip()==ramal for m in mor):
     print("Ramal já existe.")
@@ -190,6 +179,81 @@ if changed:
     print("OK: removido.")
 else:
     print("Não achei esse ramal.")
+PY
+  chmod 600 "$CFG" || true
+}
+
+# =========================
+# ✅ EDIÇÕES
+# =========================
+edit_portaria_name(){
+  read -r -p "Novo nome da PORTARIA: " newname
+  [[ -z "${newname// }" ]] && { echo "Nome inválido"; return; }
+
+  python3 - <<PY
+import json
+cfg="${CFG}"
+newname="${newname}".strip()
+data=json.load(open(cfg,"r",encoding="utf-8"))
+p=data.setdefault("portaria", {"ramal":"1000","nome":"PORTARIA","senha":""})
+p["nome"]=newname
+json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
+print("OK: nome da portaria atualizado.")
+PY
+  chmod 600 "$CFG" || true
+}
+
+edit_ap_name(){
+  echo "Selecione o AP para renomear:"
+  list_aps_indexed
+  echo
+  read -r -p "AP (número ou índice): " choice
+  local apnum
+  apnum="$(resolve_ap_choice "${choice:-}")"
+  [[ -n "${apnum:-}" ]] || { echo "AP inválido."; return; }
+
+  read -r -p "Novo nome do AP $apnum (vazio para remover nome): " newname
+
+  python3 - <<PY
+import json
+cfg="${CFG}"
+apnum="${apnum}".strip()
+newname="${newname}".strip()
+data=json.load(open(cfg,"r",encoding="utf-8"))
+for ap in data.get("apartamentos",[]):
+    if str(ap.get("numero","")).strip()==apnum:
+        if newname:
+            ap["nome"]=newname
+        else:
+            ap.pop("nome", None)
+        json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
+        print("OK: AP renomeado.")
+        raise SystemExit(0)
+print("AP não encontrado.")
+PY
+  chmod 600 "$CFG" || true
+}
+
+edit_morador_name(){
+  read -r -p "Ramal do morador para renomear (ex: 80401): " ramal
+  [[ -z "${ramal// }" ]] && { echo "Ramal inválido"; return; }
+  read -r -p "Novo nome desse morador: " newname
+  [[ -z "${newname// }" ]] && { echo "Nome inválido"; return; }
+
+  python3 - <<PY
+import json
+cfg="${CFG}"
+ramal="${ramal}".strip()
+newname="${newname}".strip()
+data=json.load(open(cfg,"r",encoding="utf-8"))
+for ap in data.get("apartamentos",[]):
+    for m in ap.get("moradores",[]):
+        if str(m.get("ramal","")).strip()==ramal:
+            m["nome"]=newname
+            json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
+            print("OK: morador renomeado.")
+            raise SystemExit(0)
+print("Ramal não encontrado.")
 PY
   chmod 600 "$CFG" || true
 }
@@ -228,7 +292,10 @@ main(){
     echo "5) Remover morador (por ramal)"
     echo "6) Aplicar configs + reiniciar Asterisk"
     echo "7) Mostrar senhas/integrações (server-only)"
-    echo "9) Instalar Asterisk (source) + Core"
+    echo "8) Editar nome PORTARIA"
+    echo "9) Editar nome AP"
+    echo "10) Editar nome MORADOR (por ramal)"
+    echo "11) Instalar Asterisk (source) + Core"
     echo "0) Sair"
     echo
     read -r -p "Escolha: " opt
@@ -240,7 +307,10 @@ main(){
       5) rm_morador; pause;;
       6) apply; pause;;
       7) show_secrets; pause;;
-      9) install_now; pause;;
+      8) edit_portaria_name; pause;;
+      9) edit_ap_name; pause;;
+      10) edit_morador_name; pause;;
+      11) install_now; pause;;
       0) exit 0;;
       *) echo "Opção inválida"; pause;;
     esac
