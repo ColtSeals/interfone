@@ -1,91 +1,79 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -euo pipefail
+IFS=$'\n\t'
 
+APP_NAME="interfone"
 APP_DIR="/opt/interfone"
-VENV_DIR="${APP_DIR}/venv"
-DB_PATH="${APP_DIR}/db.json"
+DATA_DIR="/opt/interfone/data"
+VENV_DIR="/opt/interfone/venv"
+LOG="/var/log/interfone-setup.log"
 
-AST_VER="22-current"
-AST_TARBALL="asterisk-${AST_VER}.tar.gz"
-AST_URL="https://downloads.asterisk.org/pub/telephony/asterisk/${AST_TARBALL}"
+AST_URL_DEFAULT="https://downloads.asterisk.org/pub/telephony/asterisk/asterisk-22-current.tar.gz"
+AST_URL="${AST_URL:-$AST_URL_DEFAULT}"
 
-PJSIP_MAIN="/etc/asterisk/pjsip.conf"
-EXT_MAIN="/etc/asterisk/extensions.conf"
-RTP_CONF="/etc/asterisk/rtp.conf"
-P_USERS="/etc/asterisk/pjsip_users.conf"
-E_USERS="/etc/asterisk/extensions_users.conf"
+PJSIP_USERS="/etc/asterisk/pjsip_users.conf"
+EXT_USERS="/etc/asterisk/extensions_users.conf"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_FILE="/var/log/interfone-setup.log"
-
-log(){ echo -e "\n\033[96m[interfone]\033[0m $*"; }
-die(){ echo -e "\n\033[91m[ERRO]\033[0m $*"; exit 1; }
-
-on_error() {
-  local exit_code=$?
-  echo -e "\n\033[91m[ERRO]\033[0m Falhou na linha ${BASH_LINENO[0]}: ${BASH_COMMAND}"
-  echo -e "\033[91m[ERRO]\033[0m Exit code: ${exit_code}"
-  echo -e "\n\033[93m[LOG]\033[0m Últimas linhas do log (${LOG_FILE}):"
-  tail -n 200 "${LOG_FILE}" 2>/dev/null || true
-  exit "${exit_code}"
+die() {
+  echo
+  echo "[ERRO] $1"
+  echo "[LOG] Veja: $LOG"
+  echo
+  exit 1
 }
-trap on_error ERR
 
-ensure_root() {
-  [[ "${EUID}" -eq 0 ]] || die "Rode como root (ou sudo)."
+msg() {
+  echo "[interfone] $1"
+  echo "[interfone] $1" >>"$LOG"
+}
+
+need_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    die "Execute como root: sudo ./setup.sh"
+  fi
 }
 
 detect_ssh_port() {
-  local p=""
-  if [[ -f /etc/ssh/sshd_config ]]; then
-    p="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)"
+  # tenta achar porta do sshd em runtime
+  local p
+  p="$(ss -tlpn 2>/dev/null | awk '/sshd/ {print $4}' | head -n1 | awk -F: '{print $NF}' || true)"
+  if [[ -z "${p:-}" ]]; then
+    echo "22"
+  else
+    echo "$p"
   fi
-  [[ -n "${p}" ]] && echo "${p}" || echo "22"
 }
 
-ensure_base_packages() {
-  log "Instalando pacotes base (Debian 13)..."
-  export DEBIAN_FRONTEND=noninteractive
-  apt update -y
-
-  apt install -y \
-    ca-certificates curl wget git rsync \
-    build-essential pkg-config autoconf automake libtool \
-    python3 python3-venv python3-pip \
-    ufw \
-    libssl-dev libncurses-dev libxml2-dev uuid-dev \
-    libsqlite3-dev libjansson-dev libedit-dev \
-    libcurl4-gnutls-dev \
-    libsrtp2-dev \
-    subversion
+apt_install() {
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" >>"$LOG" 2>&1
 }
 
-configure_firewall() {
-  local SSH_PORT="$1"
-  log "Configurando UFW (SSH ${SSH_PORT}/tcp, SIP 5060/udp, RTP 10000-20000/udp)..."
-  ufw allow "${SSH_PORT}/tcp" || true
-  ufw allow 5060/udp || true
-  ufw allow 10000:20000/udp || true
-  ufw --force enable || true
+ensure_os() {
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    if [[ "${ID:-}" != "debian" ]]; then
+      msg "Aviso: sistema não parece Debian (ID=${ID:-?}). Vou continuar mesmo assim."
+    fi
+  fi
 }
 
-ensure_asterisk_user() {
+ensure_user_group() {
+  if ! getent group asterisk >/dev/null 2>&1; then
+    msg "Criando grupo asterisk..."
+    groupadd --system asterisk >>"$LOG" 2>&1 || true
+  fi
   if ! id asterisk >/dev/null 2>&1; then
-    log "Criando usuário/grupo asterisk..."
-    useradd -r -d /var/lib/asterisk -s /usr/sbin/nologin asterisk || true
+    msg "Criando usuário asterisk..."
+    useradd --system --home /var/lib/asterisk --gid asterisk --shell /usr/sbin/nologin asterisk >>"$LOG" 2>&1 || true
   fi
-
-  mkdir -p /var/lib/asterisk /var/log/asterisk /var/spool/asterisk /run/asterisk /etc/asterisk
-  chown -R asterisk:asterisk /var/lib/asterisk /var/log/asterisk /var/spool/asterisk /run/asterisk || true
-  chown -R root:asterisk /etc/asterisk || true
-  chmod -R 750 /etc/asterisk || true
 }
 
-write_systemd_unit_asterisk() {
-  log "Instalando unit systemd nativa do Asterisk..."
+write_systemd_service() {
+  msg "Criando service nativo systemd do Asterisk..."
   cat >/etc/systemd/system/asterisk.service <<'UNIT'
 [Unit]
-Description=Asterisk PBX (Interfone Tactical)
+Description=Asterisk PBX
 After=network.target
 
 [Service]
@@ -93,213 +81,229 @@ Type=simple
 User=asterisk
 Group=asterisk
 RuntimeDirectory=asterisk
-RuntimeDirectoryMode=0750
-WorkingDirectory=/var/lib/asterisk
-ExecStart=/usr/sbin/asterisk -f -U asterisk -G asterisk -vvvg
+RuntimeDirectoryMode=0755
+ExecStart=/usr/sbin/asterisk -f -U asterisk -G asterisk
 ExecReload=/usr/sbin/asterisk -rx "core reload"
+ExecStop=/usr/sbin/asterisk -rx "core stop now"
 Restart=on-failure
-RestartSec=2
+RestartSec=3
 LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
-  systemctl daemon-reload
-  systemctl enable asterisk >/dev/null 2>&1 || true
+  systemctl daemon-reload >>"$LOG" 2>&1
+  systemctl enable asterisk >>"$LOG" 2>&1 || true
 }
 
-wait_asterisk_ctl() {
-  for _ in $(seq 1 30); do
-    if [[ -S /run/asterisk/asterisk.ctl || -S /var/run/asterisk/asterisk.ctl ]]; then
+wait_asterisk() {
+  msg "Iniciando Asterisk e aguardando socket de controle..."
+  systemctl restart asterisk >>"$LOG" 2>&1 || true
+
+  local i
+  for i in {1..40}; do
+    if [[ -S /var/run/asterisk/asterisk.ctl ]]; then
       return 0
     fi
-    sleep 1
+    sleep 0.5
   done
-  return 1
+  die "Asterisk não subiu (não achei /var/run/asterisk/asterisk.ctl). Verifique: systemctl status asterisk"
 }
 
 install_asterisk_from_source() {
-  if [[ -x /usr/sbin/asterisk ]]; then
-    log "Asterisk já existe em /usr/sbin/asterisk ✅"
-    write_systemd_unit_asterisk
-    systemctl restart asterisk || true
+  if command -v asterisk >/dev/null 2>&1; then
+    msg "Asterisk já existe no sistema. Pulando build."
     return 0
   fi
 
-  log "Debian 13 sem pacote 'asterisk' no apt → compilando via fonte oficial (${AST_VER})..."
-  mkdir -p /usr/src
-  cd /usr/src
+  msg "Instalando dependências de build (Debian 13)..."
+  apt-get update -y >>"$LOG" 2>&1
 
-  rm -f "${AST_TARBALL}" || true
-  wget -O "${AST_TARBALL}" "${AST_URL}"
+  # Dependências suficientes para compilar Asterisk com PJSIP (sem install_prereq)
+  apt_install \
+    ca-certificates curl wget tar gzip bzip2 xz-utils \
+    build-essential pkg-config autoconf automake libtool \
+    subversion \
+    libssl-dev libxml2-dev libsqlite3-dev uuid-dev \
+    libjansson-dev libedit-dev libncurses-dev \
+    libsrtp2-dev \
+    ufw rsync \
+    python3 python3-venv python3-pip
 
-  log "Extraindo tar e detectando pasta..."
-  # ✅ FIX: evitar SIGPIPE matar o script com pipefail (tar | head)
-  AST_DIR="$(tar -tf "${AST_TARBALL}" | head -n 1 | cut -d/ -f1 || true)"
-  [[ -n "${AST_DIR}" ]] || die "Não consegui detectar a pasta do tar. Arquivo: ${AST_TARBALL}"
-  log "Pasta detectada: ${AST_DIR}"
+  ensure_user_group
 
-  rm -rf "/usr/src/${AST_DIR}" || true
-  tar -xzf "${AST_TARBALL}"
-  cd "/usr/src/${AST_DIR}"
+  msg "Baixando Asterisk (22-current)..."
+  mkdir -p /usr/local/src/asterisk-build >>"$LOG" 2>&1
+  cd /usr/local/src/asterisk-build
+  rm -rf asterisk-22* asterisk.tar.gz >>"$LOG" 2>&1 || true
 
-  log "Pré-requisitos do Asterisk (install_prereq)..."
-  set +e
-  yes | ./contrib/scripts/install_prereq install
-  set -e
+  wget -O asterisk.tar.gz "$AST_URL" >>"$LOG" 2>&1
 
-  log "Configurando build..."
-  ./configure --with-pjproject-bundled --with-jansson-bundled
+  msg "Extraindo Asterisk..."
+  tar -xzf asterisk.tar.gz >>"$LOG" 2>&1
 
-  if [[ -f menuselect/menuselect && -f menuselect.makeopts ]]; then
-    menuselect/menuselect --enable codec_opus menuselect.makeopts >/dev/null 2>&1 || true
+  local AST_DIR
+  AST_DIR="$(find . -maxdepth 1 -type d -name "asterisk-22*" | head -n1 || true)"
+  if [[ -z "${AST_DIR:-}" ]]; then
+    die "Não consegui detectar a pasta do Asterisk após extrair. Veja o log: $LOG"
   fi
 
-  log "Compilando..."
-  make -j"$(nproc)"
+  cd "$AST_DIR"
 
-  log "Instalando..."
-  make install
+  msg "Configurando build do Asterisk (PJSIP bundled)..."
+  ./configure --with-pjproject-bundled >>"$LOG" 2>&1
 
-  log "Instalando samples..."
-  make samples
-  ldconfig
+  msg "Compilando Asterisk (isso pode demorar)..."
+  make -j"$(nproc)" >>"$LOG" 2>&1
 
-  ensure_asterisk_user
-  write_systemd_unit_asterisk
+  msg "Instalando Asterisk..."
+  make install >>"$LOG" 2>&1
+  make samples >>"$LOG" 2>&1 || true
 
-  log "Ajustando asterisk.conf (runuser/rungroup)..."
-  if [[ -f /etc/asterisk/asterisk.conf ]]; then
-    sed -i 's/^[[:space:]]*;*[[:space:]]*runuser[[:space:]]*=.*$/runuser = asterisk/' /etc/asterisk/asterisk.conf || true
-    sed -i 's/^[[:space:]]*;*[[:space:]]*rungroup[[:space:]]*=.*$/rungroup = asterisk/' /etc/asterisk/asterisk.conf || true
-  fi
+  ldconfig >>"$LOG" 2>&1 || true
 
-  log "Iniciando Asterisk..."
-  systemctl restart asterisk
+  write_systemd_service
 
-  if ! wait_asterisk_ctl; then
-    systemctl status asterisk --no-pager || true
-    die "Asterisk não subiu. Rode: journalctl -u asterisk -n 200 --no-pager"
-  fi
+  # Ajusta permissões padrão
+  mkdir -p /var/run/asterisk /var/log/asterisk /var/spool/asterisk /var/lib/asterisk >>"$LOG" 2>&1
+  chown -R asterisk:asterisk /var/run/asterisk /var/log/asterisk /var/spool/asterisk /var/lib/asterisk >>"$LOG" 2>&1 || true
+  chgrp -R asterisk /etc/asterisk >>"$LOG" 2>&1 || true
 
-  log "Asterisk instalado ✅"
+  wait_asterisk
+
+  msg "Teste Asterisk: core show version"
+  asterisk -rx "core show version" >>"$LOG" 2>&1 || die "Asterisk instalado, mas CLI não conectou."
+}
+
+configure_firewall() {
+  local SSH_PORT
+  SSH_PORT="$(detect_ssh_port)"
+
+  msg "Configurando UFW (SSH ${SSH_PORT}/tcp, SIP 5060/udp, RTP 10000-20000/udp)..."
+  ufw --force enable >>"$LOG" 2>&1 || true
+  ufw allow "${SSH_PORT}/tcp" >>"$LOG" 2>&1 || true
+  ufw allow 5060/udp >>"$LOG" 2>&1 || true
+  ufw allow 10000:20000/udp >>"$LOG" 2>&1 || true
 }
 
 write_asterisk_base_configs() {
-  log "Criando configs base (PJSIP + Dialplan + RTP)..."
+  msg "Escrevendo configs base do PJSIP e Dialplan..."
 
-  touch "${P_USERS}" "${E_USERS}"
-  chown root:asterisk "${P_USERS}" "${E_USERS}" || true
-  chmod 640 "${P_USERS}" "${E_USERS}" || true
-
-  cat >"${RTP_CONF}" <<'EOF'
+  # RTP range
+  cat >/etc/asterisk/rtp.conf <<'RTP'
 [general]
 rtpstart=10000
 rtpend=20000
-EOF
+RTP
 
-  cat >"${PJSIP_MAIN}" <<'EOF'
+  # pjsip.conf (base) + include dos usuários gerados
+  cat >/etc/asterisk/pjsip.conf <<'PJSIP'
+; ================================
+; Interfone Tactical - PJSIP Base
+; ================================
+
 [global]
 type=global
-user_agent=Interfone_Tactical
+user_agent=Interfone-Tactical
 
 [transport-udp]
 type=transport
 protocol=udp
 bind=0.0.0.0:5060
+allow_reload=yes
 
+; NAT friendly defaults (ok para VPS)
+; (mantenha direct_media=no nos endpoints gerados)
+; Os endpoints gerados vão usar:
+;   rtp_symmetric=yes, force_rport=yes, rewrite_contact=yes
+
+; Usuários gerados automaticamente:
 #include pjsip_users.conf
-EOF
+PJSIP
 
-  cat >"${EXT_MAIN}" <<'EOF'
-[residente-ctx]
-exten => 0,1,NoOp(RESIDENTE -> PORTARIA)
- same => n,Dial(PJSIP/1000,30)
- same => n,Hangup()
+  # extensions.conf (base) + include do dialplan gerado
+  cat >/etc/asterisk/extensions.conf <<'EXT'
+; ======================================
+; Interfone Tactical - Dialplan Base
+; ======================================
 
-[portaria-ctx]
+[interfone-ctx]
+; aqui entram as chamadas dos ramais (endpoints)
+; e os ramais "AP" (ex: 101, 102 etc) que disparam a estratégia
 #include extensions_users.conf
+
+; fallback padrão
+exten => i,1,Playback(pbx-invalid)
+ same => n,Hangup()
+exten => t,1,Hangup()
+EXT
+
+  # Arquivos gerados (vazios inicialmente)
+  if [[ ! -f "$PJSIP_USERS" ]]; then
+    cat >"$PJSIP_USERS" <<'EOF'
+; Arquivo gerado pelo Interfone Tactical
+; NÃO EDITE MANUALMENTE (use o painel "interfone" e sincronize)
 EOF
+  fi
 
-  chown root:asterisk "${PJSIP_MAIN}" "${EXT_MAIN}" "${RTP_CONF}" || true
-  chmod 640 "${PJSIP_MAIN}" "${EXT_MAIN}" "${RTP_CONF}" || true
+  if [[ ! -f "$EXT_USERS" ]]; then
+    cat >"$EXT_USERS" <<'EOF'
+; Arquivo gerado pelo Interfone Tactical
+; NÃO EDITE MANUALMENTE (use o painel "interfone" e sincronize)
+EOF
+  fi
 
-  systemctl restart asterisk
-  /usr/sbin/asterisk -rx "core show version" >/dev/null 2>&1 || true
+  chgrp asterisk /etc/asterisk/pjsip.conf /etc/asterisk/extensions.conf "$PJSIP_USERS" "$EXT_USERS" >>"$LOG" 2>&1 || true
+  chmod 640 /etc/asterisk/pjsip.conf /etc/asterisk/extensions.conf "$PJSIP_USERS" "$EXT_USERS" >>"$LOG" 2>&1 || true
+
+  msg "Recarregando Asterisk..."
+  asterisk -rx "core reload" >>"$LOG" 2>&1 || true
+  asterisk -rx "pjsip reload" >>"$LOG" 2>&1 || true
 }
 
 install_panel() {
-  log "Instalando painel em ${APP_DIR}..."
-  mkdir -p "${APP_DIR}"
+  msg "Instalando painel em $APP_DIR..."
 
-  rsync -a --delete \
-    --exclude ".git" \
-    --exclude "__pycache__" \
-    --exclude "*.pyc" \
-    "${SCRIPT_DIR}/" "${APP_DIR}/"
+  mkdir -p "$APP_DIR" "$DATA_DIR" >>"$LOG" 2>&1
 
-  python3 -m venv "${VENV_DIR}"
-  "${VENV_DIR}/bin/pip" install --upgrade pip wheel setuptools >/dev/null
-  "${VENV_DIR}/bin/pip" install -r "${APP_DIR}/requirements.txt"
+  # Copia arquivos do repo para /opt/interfone
+  rsync -a --delete --exclude ".git" --exclude ".github" ./ "$APP_DIR/" >>"$LOG" 2>&1
 
-  chmod -R 750 "${APP_DIR}"
+  msg "Criando venv Python..."
+  python3 -m venv "$VENV_DIR" >>"$LOG" 2>&1
+  "$VENV_DIR/bin/pip" install --upgrade pip >>"$LOG" 2>&1
+  "$VENV_DIR/bin/pip" install -r "$APP_DIR/requirements.txt" >>"$LOG" 2>&1
 
-  if [[ ! -f "${DB_PATH}" ]]; then
-    local PASS
-    PASS="$(python3 - <<'PY'
-import secrets
-print(secrets.token_urlsafe(10))
-PY
-)"
-    cat >"${DB_PATH}" <<EOF
-{
-  "portaria": { "sip": "1000", "name": "Portaria", "password": "${PASS}" },
-  "apartments": []
-}
-EOF
-    chmod 640 "${DB_PATH}" || true
-    log "Portaria criada: SIP=1000 | SENHA=${PASS}"
-  fi
-
-  log "Criando comando global: /usr/local/bin/interfone"
-  cat >/usr/local/bin/interfone <<'SH'
+  msg "Instalando comando /usr/local/bin/interfone..."
+  cat >/usr/local/bin/interfone <<'BIN'
 #!/usr/bin/env bash
-set -euo pipefail
-APP_DIR="/opt/interfone"
-exec "${APP_DIR}/venv/bin/python" "${APP_DIR}/interfone.py" "$@"
-SH
-  chmod +x /usr/local/bin/interfone
+exec /opt/interfone/venv/bin/python /opt/interfone/interfone.py "$@"
+BIN
+  chmod +x /usr/local/bin/interfone >>"$LOG" 2>&1
 }
 
 main() {
-  ensure_root
+  : >"$LOG"
+  need_root
+  ensure_os
 
-  mkdir -p "$(dirname "${LOG_FILE}")"
-  touch "${LOG_FILE}"
-  chmod 600 "${LOG_FILE}" || true
-  exec > >(tee -a "${LOG_FILE}") 2>&1
+  msg "=============================="
+  msg "INTERFONE TACTICAL (Debian 13)"
+  msg "=============================="
 
-  local SSH_PORT
-  SSH_PORT="$(detect_ssh_port)"
-
-  log "=============================="
-  log "INTERFONE TACTICAL (Debian 13)"
-  log "=============================="
-  log "SSH detectada: ${SSH_PORT}"
-  log "Log: ${LOG_FILE}"
-
-  ensure_base_packages
-  configure_firewall "${SSH_PORT}"
-
-  ensure_asterisk_user
+  configure_firewall
   install_asterisk_from_source
   write_asterisk_base_configs
   install_panel
 
-  log "Tudo pronto ✅"
-  log "Teste: /usr/sbin/asterisk -rx \"core show version\""
-  log "Rodar painel: interfone"
+  msg "Tudo pronto ✅"
+  echo
+  echo "[interfone] Teste Asterisk: asterisk -rx \"core show version\""
+  echo "[interfone] Rodar painel:   interfone"
+  echo
+  echo "[interfone] Dica: crie primeiro o AP 1000 (Portaria) e adicione o SIP do porteiro."
+  echo
 }
 
 main "$@"
