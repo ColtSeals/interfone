@@ -2,36 +2,21 @@
 set -euo pipefail
 
 APP_DIR="/opt/interfone"
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${APP_DIR}/venv"
 
+# Asterisk
 AST_VER="22-current"
 AST_TARBALL="asterisk-${AST_VER}.tar.gz"
 AST_URL="https://downloads.asterisk.org/pub/telephony/asterisk/${AST_TARBALL}"
 
+# Asterisk files
 PJSIP_MAIN="/etc/asterisk/pjsip.conf"
 EXT_MAIN="/etc/asterisk/extensions.conf"
 P_USERS="/etc/asterisk/pjsip_users.conf"
 E_USERS="/etc/asterisk/extensions_users.conf"
 
 log(){ echo -e "\n\033[96m[interfone]\033[0m $*"; }
-warn(){ echo -e "\n\033[93m[avis]\033[0m $*"; }
-die(){ echo -e "\n\033[91m[erro]\033[0m $*"; exit 1; }
-
-require_root() {
-  [[ "${EUID}" -eq 0 ]] || die "Rode como root: sudo ./setup.sh"
-}
-
-check_debian13() {
-  [[ -f /etc/os-release ]] || die "/etc/os-release não encontrado"
-  . /etc/os-release
-  if [[ "${ID:-}" != "debian" ]]; then
-    die "Este setup é para Debian. Detectado: ${ID:-desconhecido}"
-  fi
-  if [[ "${VERSION_ID:-}" != "13" ]]; then
-    die "Você pediu Debian 13. Detectado Debian ${VERSION_ID:-?} (${VERSION_CODENAME:-?}). Reinstale a VPS em Debian 13 (trixie)."
-  fi
-}
+die(){ echo -e "\n\033[91m[ERRO]\033[0m $*"; exit 1; }
 
 detect_ssh_port() {
   local p=""
@@ -41,7 +26,7 @@ detect_ssh_port() {
   [[ -n "${p}" ]] && echo "${p}" || echo "22"
 }
 
-install_base() {
+ensure_base_packages() {
   log "Instalando pacotes base..."
   apt update -y
   apt install -y \
@@ -53,43 +38,44 @@ install_base() {
 
 configure_firewall() {
   local SSH_PORT="$1"
-  log "Configurando UFW (sem te trancar): SSH ${SSH_PORT}/tcp | SIP 5060/udp | RTP 10000-20000/udp"
+  log "Configurando UFW (SSH ${SSH_PORT}/tcp, SIP 5060/udp, RTP 10000-20000/udp)..."
   ufw allow "${SSH_PORT}/tcp" || true
   ufw allow 5060/udp || true
   ufw allow 10000:20000/udp || true
   ufw --force enable || true
 }
 
-install_asterisk_if_needed() {
-  if command -v asterisk >/dev/null 2>&1; then
-    local v
-    v="$(asterisk -V 2>/dev/null || true)"
-    warn "Asterisk já parece instalado: ${v}"
-    return 0
+install_asterisk() {
+  log "Tentando instalar Asterisk via apt..."
+  set +e
+  apt install -y asterisk
+  local ok=$?
+  set -e
+
+  if [[ $ok -eq 0 ]]; then
+    log "Asterisk instalado via apt ✅"
+    return
   fi
 
-  log "Asterisk não está instalado via apt no Debian 13 — compilando do fonte oficial (${AST_VER})..."
-
+  log "Sem pacote 'asterisk' no apt — compilando do fonte oficial (${AST_VER})..."
   mkdir -p /usr/src
   cd /usr/src
 
   rm -f "${AST_TARBALL}" 2>/dev/null || true
-  wget -O "${AST_TARBALL}" "${AST_URL}"
+  wget -O "${AST_TARBALL}" "${AST_URL}" || die "Falha ao baixar ${AST_URL}"
 
-  # Detecta o diretório real dentro do tar SEM quebrar por pipefail/SIGPIPE
-  set +o pipefail
-  AST_DIR="$(tar -tf "${AST_TARBALL}" | sed -n '1{s@/.*@@p;q}')"
-  set -o pipefail
-
-  [[ -n "${AST_DIR}" ]] || die "Não consegui detectar a pasta do tar do Asterisk."
+  # Detecta o nome real da pasta dentro do tar (evita erro de cd)
+  AST_DIR="$(tar -tf "${AST_TARBALL}" | head -1 | cut -d/ -f1)"
+  [[ -n "${AST_DIR}" ]] || die "Não consegui detectar a pasta do tar."
   rm -rf "/usr/src/${AST_DIR}" 2>/dev/null || true
   tar -xzf "${AST_TARBALL}"
+
   cd "/usr/src/${AST_DIR}"
 
-  log "Instalando pré-requisitos do Asterisk (install_prereq)..."
+  log "Pré-requisitos do Asterisk (install_prereq)..."
   yes | ./contrib/scripts/install_prereq install || true
 
-  log "Configurando/compilando Asterisk..."
+  log "Compilando Asterisk..."
   ./configure
   make -j"$(nproc)"
   make install
@@ -97,12 +83,10 @@ install_asterisk_if_needed() {
   make config
   ldconfig
 
-  # usuário de execução
   if ! id asterisk >/dev/null 2>&1; then
     useradd -r -d /var/lib/asterisk -s /usr/sbin/nologin asterisk || true
   fi
 
-  # rodar como usuário asterisk
   if [[ -f /etc/asterisk/asterisk.conf ]]; then
     sed -i 's/^[[:space:]]*;*[[:space:]]*runuser[[:space:]]*=.*$/runuser = asterisk/' /etc/asterisk/asterisk.conf || true
     sed -i 's/^[[:space:]]*;*[[:space:]]*rungroup[[:space:]]*=.*$/rungroup = asterisk/' /etc/asterisk/asterisk.conf || true
@@ -116,7 +100,6 @@ install_asterisk_if_needed() {
   systemctl enable --now asterisk || true
 
   log "Asterisk instalado ✅"
-  asterisk -rx "core show version" || true
 }
 
 write_base_asterisk_configs() {
@@ -142,7 +125,7 @@ EOF
 
   cat > "${EXT_MAIN}" <<'EOF'
 [interfone-ctx]
-; Discagem 0 -> Portaria (ramal SIP 1000)
+; Portaria (ramal 1000)
 exten => 0,1,NoOp(Chamando Portaria)
  same => n,Dial(PJSIP/1000,30)
  same => n,Hangup()
@@ -154,23 +137,28 @@ EOF
   chmod 640 "${PJSIP_MAIN}" "${EXT_MAIN}" || true
 
   systemctl restart asterisk || true
-  asterisk -rx "core reload" || true
+
+  # só tenta -rx depois que o ctl existir
+  for i in {1..20}; do
+    [[ -S /run/asterisk/asterisk.ctl || -S /var/run/asterisk/asterisk.ctl ]] && break
+    sleep 0.3
+  done
+
+  asterisk -rx "core reload" >/dev/null 2>&1 || true
 }
 
 install_panel() {
   log "Instalando painel em ${APP_DIR}..."
-
   mkdir -p "${APP_DIR}"
-  rsync -a --delete "${REPO_DIR}/" "${APP_DIR}/"
+  rsync -a --delete "$(pwd)/" "${APP_DIR}/"
 
   python3 -m venv "${VENV_DIR}"
   "${VENV_DIR}/bin/pip" install --upgrade pip wheel setuptools >/dev/null
-  "${VENV_DIR}/bin/pip" install -r "${APP_DIR}/requirements.txt"
+  "${VENV_DIR}/bin/pip" install -r "${APP_DIR}/requirements.txt" >/dev/null
 
-  chmod -R 750 "${APP_DIR}"
+  chmod +x "${APP_DIR}/interfone.py"
 
-  # atalho
-  ln -sf "${VENV_DIR}/bin/python" /usr/local/bin/interfone-py
+  # comando global
   cat > /usr/local/bin/interfone <<EOF
 #!/usr/bin/env bash
 exec ${VENV_DIR}/bin/python ${APP_DIR}/interfone.py "\$@"
@@ -181,9 +169,6 @@ EOF
 }
 
 main() {
-  require_root
-  check_debian13
-
   local SSH_PORT
   SSH_PORT="$(detect_ssh_port)"
 
@@ -192,9 +177,9 @@ main() {
   log "=============================="
   log "SSH detectada: ${SSH_PORT}"
 
-  install_base
+  ensure_base_packages
   configure_firewall "${SSH_PORT}"
-  install_asterisk_if_needed
+  install_asterisk
   write_base_asterisk_configs
   install_panel
 
