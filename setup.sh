@@ -23,12 +23,12 @@ warn(){ echo -e "\n\033[93m[warn]\033[0m $*"; }
 die(){ echo -e "\n\033[91m[ERRO]\033[0m $*"; exit 1; }
 
 on_error() {
-  local exit_code=$?
+  local ec=$?
   echo -e "\n\033[91m[ERRO]\033[0m Falhou na linha ${BASH_LINENO[0]}: ${BASH_COMMAND}"
-  echo -e "\033[91m[ERRO]\033[0m Exit code: ${exit_code}"
+  echo -e "\033[91m[ERRO]\033[0m Exit code: ${ec}"
   echo -e "\n\033[93m[LOG]\033[0m Últimas linhas do log (${LOG_FILE}):"
-  tail -n 80 "${LOG_FILE}" 2>/dev/null || true
-  exit "${exit_code}"
+  tail -n 120 "${LOG_FILE}" 2>/dev/null || true
+  exit "${ec}"
 }
 trap on_error ERR
 
@@ -131,13 +131,14 @@ install_asterisk_from_source() {
     return 0
   fi
 
-  log "Compilando Asterisk via fonte oficial (${AST_VER})..."
+  log "Baixando Asterisk (${AST_VER})..."
   mkdir -p /usr/src
   cd /usr/src
 
   rm -f "${AST_TARBALL}" || true
   wget -O "${AST_TARBALL}" "${AST_URL}"
 
+  log "Extraindo tar e detectando pasta..."
   local AST_DIR
   AST_DIR="$(tar -tf "${AST_TARBALL}" | head -1 | cut -d/ -f1)"
   [[ -n "${AST_DIR}" ]] || die "Não consegui detectar a pasta do tar."
@@ -146,7 +147,7 @@ install_asterisk_from_source() {
   tar -xzf "${AST_TARBALL}"
   cd "/usr/src/${AST_DIR}"
 
-  log "Pré-requisitos do Asterisk (install_prereq)..."
+  log "install_prereq (se falhar, seguimos com os deps do apt)..."
   set +e
   yes | ./contrib/scripts/install_prereq install
   set -e
@@ -158,8 +159,9 @@ install_asterisk_from_source() {
     menuselect/menuselect --enable codec_opus menuselect.makeopts >/dev/null 2>&1 || true
   fi
 
-  log "Compilando... (logs em ${LOG_FILE})"
+  log "Compilando..."
   make -j"$(nproc)"
+  log "Instalando..."
   make install
   ldconfig
 
@@ -229,12 +231,20 @@ install_panel() {
     --exclude "*.pyc" \
     "${SCRIPT_DIR}/" "${APP_DIR}/"
 
+  if [[ ! -f "${APP_DIR}/requirements.txt" ]]; then
+    die "Faltou requirements.txt no repositório."
+  fi
+  if [[ ! -f "${APP_DIR}/interfone.py" ]]; then
+    die "Faltou interfone.py no repositório."
+  fi
+
   python3 -m venv "${VENV_DIR}"
   "${VENV_DIR}/bin/pip" install --upgrade pip wheel setuptools >/dev/null
   "${VENV_DIR}/bin/pip" install -r "${APP_DIR}/requirements.txt"
 
   chmod -R 750 "${APP_DIR}"
 
+  # cria DB default se não existir
   if [[ ! -f "${DB_PATH}" ]]; then
     local PASS
     PASS="$(python3 - <<'PY'
@@ -256,8 +266,7 @@ EOF
   cat >/usr/local/bin/interfone <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-APP_DIR="/opt/interfone"
-exec "${APP_DIR}/venv/bin/python" "${APP_DIR}/interfone.py" "$@"
+exec /opt/interfone/venv/bin/python /opt/interfone/interfone.py "$@"
 SH
   chmod +x /usr/local/bin/interfone
 }
