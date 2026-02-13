@@ -1,170 +1,183 @@
+cd ~/interfone
+
+cat > setup.sh <<'BASH'
 #!/usr/bin/env bash
-set -euo pipefail
-
-# ==============================
-# SETUP TACTICAL - INTERFONE v7.0
-# Debian 13 + Asterisk (PJSIP)
-# ==============================
-
-if [[ $EUID -ne 0 ]]; then
-  echo "❌ Rode como root: sudo ./setup.sh"
-  exit 1
-fi
+set -u
 
 APP_DIR="/opt/interfone"
-DATA_DIR="$APP_DIR/data"
-LOG_DIR="/var/log/interfone"
-DB_FILE="$DATA_DIR/condominio.json"
+VENV_DIR="/opt/interfone/venv"
+AST_VER="20-current"
+AST_TARBALL="asterisk-${AST_VER}.tar.gz"
+AST_URL="https://downloads.asterisk.org/pub/telephony/asterisk/${AST_TARBALL}"
+AST_SRC="/usr/src/asterisk-${AST_VER}"
 
-AST_ETC="/etc/asterisk"
-PJSIP_MAIN="$AST_ETC/pjsip.conf"
-EXT_MAIN="$AST_ETC/extensions.conf"
-PJSIP_USERS="$AST_ETC/pjsip_users.conf"
-EXT_USERS="$AST_ETC/extensions_users.conf"
-CDR_CONF="$AST_ETC/cdr.conf"
-CDRCSV_CONF="$AST_ETC/cdr_csv.conf"
+PJSIP_MAIN="/etc/asterisk/pjsip.conf"
+EXT_MAIN="/etc/asterisk/extensions.conf"
+P_USERS="/etc/asterisk/pjsip_users.conf"
+E_USERS="/etc/asterisk/extensions_users.conf"
 
-# Detecta porta SSH pra não te trancar
-SSH_PORT="$(awk '/^Port[[:space:]]+[0-9]+/{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null || true)"
-if [[ -z "${SSH_PORT}" ]]; then SSH_PORT="22"; fi
+log(){ echo -e "\n\033[96m[interfone]\033[0m $*"; }
+die(){ echo -e "\n\033[91m[ERRO]\033[0m $*"; exit 1; }
 
-echo "=============================="
-echo "INTERFONE TACTICAL v7.0"
-echo "=============================="
-echo "SSH Port detectada: ${SSH_PORT}"
-echo
-
-echo ">>> [1/6] Instalando dependências (Asterisk + Python + UFW)..."
-apt update -y
-apt install -y asterisk python3 python3-venv python3-pip ufw
-
-echo ">>> [2/6] Firewall UFW (sem te trancar)..."
-ufw allow "${SSH_PORT}/tcp" >/dev/null
-ufw allow 5060/udp >/dev/null
-ufw allow 10000:20000/udp >/dev/null
-ufw --force enable >/dev/null
-ufw status
-
-echo ">>> [3/6] Estruturando pastas do Interfone..."
-mkdir -p "$APP_DIR" "$DATA_DIR" "$LOG_DIR"
-chmod 750 "$APP_DIR" "$DATA_DIR"
-chmod 750 "$LOG_DIR"
-
-if [[ ! -f "$DB_FILE" ]]; then
-  cat > "$DB_FILE" <<'JSON'
-{
-  "meta": {
-    "name": "Condominio",
-    "created_at": "init"
-  },
-  "users": []
+detect_ssh_port() {
+  # Tenta extrair a porta real do SSHD; fallback para 22
+  local p
+  p="$(ss -tnlp 2>/dev/null | awk '/sshd/ {print $4}' | head -n1 | sed -E 's/.*:([0-9]+)$/\1/')"
+  [[ -n "${p}" ]] && echo "${p}" || echo "22"
 }
-JSON
-  chmod 640 "$DB_FILE"
-fi
 
-echo ">>> [4/6] Config base do Asterisk (PJSIP + Dialplan + CDR)..."
+ensure_base_packages() {
+  log "Instalando pacotes base..."
+  apt update -y
+  apt install -y \
+    ca-certificates curl wget git \
+    build-essential pkg-config \
+    python3 python3-venv python3-pip \
+    ufw
+}
 
-# Include files
-touch "$PJSIP_USERS" "$EXT_USERS"
-chmod 640 "$PJSIP_USERS" "$EXT_USERS"
+configure_firewall() {
+  local SSH_PORT="$1"
+  log "Configurando UFW (SSH ${SSH_PORT}/tcp, SIP 5060/udp, RTP 10000-20000/udp)..."
+  ufw allow "${SSH_PORT}/tcp" || true
+  ufw allow 5060/udp || true
+  ufw allow 10000:20000/udp || true
+  ufw --force enable || true
+}
 
-# pjsip.conf base com templates (bem mais limpo/maintainable)
-cat > "$PJSIP_MAIN" <<'EOF'
+install_asterisk_via_apt_or_source() {
+  log "Tentando instalar Asterisk via apt..."
+  set +e
+  apt install -y asterisk
+  local ok=$?
+  set -e
+  if [[ $ok -eq 0 ]]; then
+    log "Asterisk instalado via apt ✅"
+    return 0
+  fi
+
+  log "Pacote 'asterisk' não disponível no apt — compilando do fonte oficial (${AST_VER})..."
+  rm -rf "${AST_SRC}" /usr/src/"${AST_TARBALL}" 2>/dev/null || true
+  mkdir -p /usr/src
+  cd /usr/src
+
+  wget -O "${AST_TARBALL}" "${AST_URL}" || die "Falha ao baixar ${AST_URL}"
+  tar -xzf "${AST_TARBALL}"
+  cd "${AST_SRC}"
+
+  # Pré-requisitos (recomendado pelo README do Asterisk)
+  log "Instalando pré-requisitos do Asterisk (install_prereq)..."
+  set +e
+  yes | ./contrib/scripts/install_prereq install
+  set -e
+
+  log "Configurando e compilando Asterisk..."
+  ./configure
+  make -j"$(nproc)"
+  make install
+  make samples
+  make config
+  ldconfig
+
+  # Usuário/grupo de execução
+  if ! id asterisk >/dev/null 2>&1; then
+    useradd -r -d /var/lib/asterisk -s /usr/sbin/nologin asterisk
+  fi
+
+  # Rodar como usuário asterisk
+  if [[ -f /etc/asterisk/asterisk.conf ]]; then
+    sed -i 's/^\s*;*\s*runuser\s*=.*$/runuser = asterisk/' /etc/asterisk/asterisk.conf || true
+    sed -i 's/^\s*;*\s*rungroup\s*=.*$/rungroup = asterisk/' /etc/asterisk/asterisk.conf || true
+  fi
+
+  chown -R asterisk:asterisk /var/lib/asterisk /var/log/asterisk /var/spool/asterisk /var/run/asterisk 2>/dev/null || true
+  chown -R root:asterisk /etc/asterisk 2>/dev/null || true
+  chmod -R 750 /etc/asterisk 2>/dev/null || true
+
+  systemctl daemon-reload || true
+  systemctl enable --now asterisk || true
+  log "Asterisk compilado e instalado ✅"
+}
+
+write_interfone_base_configs() {
+  log "Aplicando configs base do Interfone (PJSIP + dialplan)..."
+
+  mkdir -p /etc/asterisk
+  touch "${P_USERS}" "${E_USERS}"
+  chown root:asterisk "${P_USERS}" "${E_USERS}" || true
+  chmod 640 "${P_USERS}" "${E_USERS}" || true
+
+  cat > "${PJSIP_MAIN}" <<EOF
 [global]
 type=global
-user_agent=Interfone_Tactical_v7
+user_agent=Interfone_Tactical
 
 [transport-udp]
 type=transport
 protocol=udp
 bind=0.0.0.0:5060
 
-; =========================
-; Templates PJSIP (Premium)
-; =========================
-[auth-template](!)
-type=auth
-auth_type=userpass
-
-[aor-template](!)
-type=aor
-max_contacts=1
-remove_existing=yes
-qualify_frequency=30
-
-[endpoint-template](!)
-type=endpoint
-disallow=all
-allow=ulaw,alaw,gsm,opus
-transport=transport-udp
-direct_media=no
-rtp_symmetric=yes
-force_rport=yes
-rewrite_contact=yes
-timers=yes
-t38_udptl=no
-trust_id_inbound=yes
-send_pai=yes
-
 #include pjsip_users.conf
 EOF
-chmod 640 "$PJSIP_MAIN"
 
-# extensions.conf base
-cat > "$EXT_MAIN" <<'EOF'
-[interfone-common]
-; Qualquer coisa não prevista cai fora
-exten => _X.,1,Hangup()
-
-[interfone-portaria]
-; Ramal fixo da portaria (PJSIP/1000)
-exten => 0,1,NoOp(Interfone: Chamando Portaria)
- same => n,Dial(PJSIP/1000,30)
+  cat > "${EXT_MAIN}" <<EOF
+[interfone-ctx]
+; Ramal de Emergência/Portaria (0)
+exten => 0,1,Dial(PJSIP/1000,30)
  same => n,Hangup()
 
 #include extensions_users.conf
 EOF
-chmod 640 "$EXT_MAIN"
 
-# Habilita CDR CSV (histórico de chamadas)
-# Obs: Alguns pacotes já vêm com isso, mas garantimos o básico.
-if [[ -f "$CDR_CONF" ]]; then
-  sed -i 's/^[; ]*enable *=.*/enable = yes/' "$CDR_CONF" || true
-else
-  cat > "$CDR_CONF" <<'EOF'
-[general]
-enable = yes
-unanswered = yes
-congestion = yes
-batch = no
-EOF
-fi
+  chown root:asterisk "${PJSIP_MAIN}" "${EXT_MAIN}" || true
+  chmod 640 "${PJSIP_MAIN}" "${EXT_MAIN}" || true
 
-if [[ -f "$CDRCSV_CONF" ]]; then
-  sed -i 's/^[; ]*usegmtime *=.*/usegmtime = no/' "$CDRCSV_CONF" || true
-  sed -i 's/^[; ]*loguniqueid *=.*/loguniqueid = yes/' "$CDRCSV_CONF" || true
-else
-  cat > "$CDRCSV_CONF" <<'EOF'
-[general]
-usegmtime = no
-loguniqueid = yes
-EOF
-fi
+  systemctl restart asterisk || true
+  asterisk -rx "core reload" >/dev/null 2>&1 || true
+}
 
-echo ">>> [5/6] Python venv + dependências do painel (Textual)..."
-python3 -m venv "$APP_DIR/venv"
-"$APP_DIR/venv/bin/pip" install --upgrade pip >/dev/null
-"$APP_DIR/venv/bin/pip" install textual psutil >/dev/null
+prepare_python_env() {
+  log "Preparando ambiente Python em ${VENV_DIR}..."
+  mkdir -p "${APP_DIR}"
+  python3 -m venv "${VENV_DIR}"
+  "${VENV_DIR}/bin/pip" install --upgrade pip wheel setuptools >/dev/null
 
-echo ">>> [6/6] Reiniciando e habilitando Asterisk..."
-systemctl restart asterisk
-systemctl enable asterisk >/dev/null
+  # Se o repo tiver requirements.txt, instala
+  if [[ -f "$(pwd)/requirements.txt" ]]; then
+    "${VENV_DIR}/bin/pip" install -r "$(pwd)/requirements.txt"
+  fi
 
-echo
-echo "✅ SETUP CONCLUÍDO!"
-echo "----------------------------------------------------"
-echo "1) Coloque o interfone.py em /opt/interfone/interfone.py"
-echo "2) Rode o painel:"
-echo "   sudo /opt/interfone/venv/bin/python /opt/interfone/interfone.py"
-echo "----------------------------------------------------"
+  # Copia o app para /opt/interfone (ajusta nomes conforme teu repo)
+  rsync -a --delete "$(pwd)/" "${APP_DIR}/"
+  chmod -R 750 "${APP_DIR}"
+}
+
+main() {
+  local SSH_PORT
+  SSH_PORT="$(detect_ssh_port)"
+
+  log "=============================="
+  log "INTERFONE TACTICAL (Debian 13 fix)"
+  log "=============================="
+  log "SSH detectada: ${SSH_PORT}"
+
+  ensure_base_packages
+  configure_firewall "${SSH_PORT}"
+  install_asterisk_via_apt_or_source
+  write_interfone_base_configs
+  prepare_python_env
+
+  log "Tudo pronto ✅"
+  log "Teste rápido:"
+  log "  systemctl status asterisk --no-pager"
+  log "  asterisk -rx \"core show version\""
+  log "Rodar o painel:"
+  log "  ${VENV_DIR}/bin/python ${APP_DIR}/interfone.py"
+}
+
+set -e
+main "$@"
+BASH
+
+chmod +x setup.sh
+./setup.sh
