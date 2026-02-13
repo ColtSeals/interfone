@@ -1,3 +1,4 @@
+cat > menu.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -6,31 +7,33 @@ CFG="$APP_DIR/condo.json"
 SECRETS="/root/interfone-secrets.json"
 INTEG_TXT="/root/interfone-integrations.txt"
 
-need_root() {
-  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-    exec sudo bash "$0" "$@"
+A_BIN=""
+
+need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || exec sudo bash "$0" "$@"; }
+
+pause(){ read -r -p "ENTER para continuar..." _; }
+
+pick_asterisk(){
+  if command -v asterisk >/dev/null 2>&1; then
+    A_BIN="$(command -v asterisk)"
+  elif [[ -x /usr/sbin/asterisk ]]; then
+    A_BIN="/usr/sbin/asterisk"
+  else
+    A_BIN=""
   fi
 }
 
-pause() { read -r -p "ENTER para continuar..." _; }
-
-detect_public_ip() {
-  ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -n1
-}
-
-regen() {
-  local ip
-  ip="$(detect_public_ip)"
-  if [[ -z "${ip:-}" ]]; then
-    echo "Não detectei IP. Ajuste no install.sh com --ip."
+require_asterisk(){
+  pick_asterisk
+  if [[ -z "$A_BIN" ]]; then
+    echo "Asterisk NÃO está instalado."
+    echo "Rode primeiro: sudo bash install.sh"
     return 1
   fi
-  echo "Regenerando configs com IP: $ip"
-  bash ./install.sh --ip "$ip" >/dev/null
-  echo "OK: configs regenerados."
+  return 0
 }
 
-list_condo() {
+list_condo(){
   python3 - <<PY
 import json
 data=json.load(open("${CFG}","r",encoding="utf-8"))
@@ -43,10 +46,9 @@ for ap in data.get("apartamentos",[]):
 PY
 }
 
-add_apartment() {
+add_apartment(){
   read -r -p "Número do AP (ex: 804): " apnum
   [[ -z "${apnum// }" ]] && { echo "AP inválido"; return; }
-
   python3 - <<PY
 import json
 cfg="${CFG}"
@@ -59,10 +61,10 @@ else:
     json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
     print("OK: AP criado.")
 PY
-  chmod 600 "$CFG"
+  chmod 600 "$CFG" || true
 }
 
-add_resident() {
+add_resident(){
   read -r -p "AP (ex: 804): " apnum
   read -r -p "Ramal SIP (ex: 80401): " ramal
   read -r -p "Nome (ex: AP804-01): " nome
@@ -86,12 +88,12 @@ if any(m.get("ramal")== "${ramal}" for m in mor):
 else:
     mor.append({"ramal":"${ramal}","nome":"${nome}","senha":""})
     json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
-    print("OK: morador adicionado (senha será gerada ao regenerar).")
+    print("OK: morador adicionado (senha será gerada ao aplicar).")
 PY
-  chmod 600 "$CFG"
+  chmod 600 "$CFG" || true
 }
 
-remove_resident() {
+remove_resident(){
   read -r -p "Ramal a remover (ex: 80401): " ramal
   [[ -z "${ramal// }" ]] && { echo "Ramal inválido"; return; }
 
@@ -112,47 +114,36 @@ if changed:
 else:
     print("Não achei esse ramal.")
 PY
-  chmod 600 "$CFG"
+  chmod 600 "$CFG" || true
 }
 
-show_status() {
+apply_configs(){
+  echo "Aplicando configs..."
+  bash ./install.sh --apply-only
+  echo "OK."
+}
+
+show_status(){
+  require_asterisk || return
   echo "---- ENDPOINTS ----"
-  asterisk -rx "pjsip show endpoints" || true
+  "$A_BIN" -rx "pjsip show endpoints" || true
   echo
   echo "---- CONTACTS (ONLINE/OFFLINE) ----"
-  asterisk -rx "pjsip show contacts" || true
+  "$A_BIN" -rx "pjsip show contacts" || true
   echo
   echo "---- CHANNELS (EM LIGAÇÃO) ----"
-  asterisk -rx "core show channels concise" || true
+  "$A_BIN" -rx "core show channels concise" || true
 }
 
-show_secrets() {
+show_secrets(){
   echo "Senhas SIP: $SECRETS"
-  [[ -f "$SECRETS" ]] && (sed -n '1,200p' "$SECRETS" | head -n 120) || echo "Ainda não gerado. Rode install.sh."
+  [[ -f "$SECRETS" ]] && (sed -n '1,200p' "$SECRETS" | head -n 120) || echo "Ainda não gerado."
   echo
   echo "AMI/ARI: $INTEG_TXT"
   [[ -f "$INTEG_TXT" ]] && cat "$INTEG_TXT" || true
 }
 
-firewall_menu() {
-  echo "UFW status:"
-  ufw status || true
-  echo
-  echo "Portas necessárias:"
-  echo " - 5060/udp (SIP)"
-  echo " - 10000-20000/udp (RTP áudio)"
-  echo
-  read -r -p "Reaplicar regras básicas e habilitar UFW? (s/n): " yn
-  if [[ "${yn,,}" == "s" ]]; then
-    ufw allow OpenSSH
-    ufw allow 5060/udp
-    ufw allow 10000:20000/udp
-    ufw --force enable
-    ufw status
-  fi
-}
-
-main_menu() {
+main_menu(){
   while true; do
     clear
     echo "===================================="
@@ -163,9 +154,8 @@ main_menu() {
     echo "3) Adicionar AP"
     echo "4) Adicionar morador (ramal SIP)"
     echo "5) Remover morador (por ramal)"
-    echo "6) Regenerar configs + reiniciar Asterisk"
+    echo "6) Aplicar configs + reiniciar Asterisk"
     echo "7) Mostrar senhas/integrações (server-only)"
-    echo "8) Firewall (UFW)"
     echo "0) Sair"
     echo
     read -r -p "Escolha: " opt
@@ -176,9 +166,8 @@ main_menu() {
       3) add_apartment; pause ;;
       4) add_resident; pause ;;
       5) remove_resident; pause ;;
-      6) regen; pause ;;
+      6) apply_configs; pause ;;
       7) show_secrets; pause ;;
-      8) firewall_menu; pause ;;
       0) exit 0 ;;
       *) echo "Opção inválida"; pause ;;
     esac
@@ -186,10 +175,7 @@ main_menu() {
 }
 
 need_root "$@"
-
-if [[ ! -f "./install.sh" ]]; then
-  echo "Rode o menu dentro da pasta do repo (onde existe install.sh)."
-  exit 1
-fi
-
 main_menu
+EOF
+
+chmod +x menu.sh
