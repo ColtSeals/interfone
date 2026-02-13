@@ -9,14 +9,11 @@ INTEG_TXT="/root/interfone-integrations.txt"
 need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || exec sudo bash "$0" "$@"; }
 pause(){ read -r -p "ENTER para continuar..." _; }
 
-has_asterisk(){
-  command -v asterisk >/dev/null 2>&1
-}
+has_asterisk(){ command -v asterisk >/dev/null 2>&1; }
 
 show_status(){
   if ! has_asterisk; then
-    echo "Asterisk NÃO está instalado."
-    echo "Use a opção 9) Instalar Asterisk"
+    echo "Asterisk NÃO está instalado. Use 9) Instalar Asterisk."
     return
   fi
   echo "---- ENDPOINTS ----"
@@ -27,6 +24,65 @@ show_status(){
   echo
   echo "---- CHANNELS (EM LIGAÇÃO) ----"
   asterisk -rx "core show channels concise" || true
+}
+
+# ================
+# Helpers de APs
+# ================
+list_aps_indexed(){
+  python3 - <<PY
+import json
+data=json.load(open("${CFG}","r",encoding="utf-8"))
+aps=data.get("apartamentos",[])
+if not aps:
+    print("(Nenhum AP cadastrado)")
+    raise SystemExit(0)
+
+for i, ap in enumerate(aps, 1):
+    n=ap.get("numero","?")
+    q=len(ap.get("moradores",[]))
+    print(f"{i}) AP {n}  ({q} morador(es))")
+PY
+}
+
+get_ap_numbers(){
+  python3 - <<PY
+import json
+data=json.load(open("${CFG}","r",encoding="utf-8"))
+aps=data.get("apartamentos",[])
+print(" ".join([str(a.get("numero","")).strip() for a in aps if str(a.get("numero","")).strip()]))
+PY
+}
+
+resolve_ap_choice(){
+  # retorna AP number resolvido via stdout
+  # aceita: "804" ou "2" (índice)
+  local choice="$1"
+  python3 - <<PY
+import json, sys
+choice=sys.argv[1].strip()
+data=json.load(open("${CFG}","r",encoding="utf-8"))
+aps=data.get("apartamentos",[])
+
+if not aps:
+    print("")
+    sys.exit(0)
+
+# se for índice
+if choice.isdigit():
+    idx=int(choice)
+    if 1 <= idx <= len(aps):
+        print(str(aps[idx-1].get("numero","")).strip())
+        sys.exit(0)
+
+# senão tenta por número do AP
+for ap in aps:
+    if str(ap.get("numero","")).strip() == choice:
+        print(choice)
+        sys.exit(0)
+
+print("")
+PY "$choice"
 }
 
 list_condo(){
@@ -43,17 +99,22 @@ PY
 }
 
 add_ap(){
+  echo "APs atuais:"
+  list_aps_indexed
+  echo
   read -r -p "Número do AP (ex: 804): " apnum
   [[ -z "${apnum// }" ]] && { echo "AP inválido"; return; }
+
   python3 - <<PY
 import json
 cfg="${CFG}"
+apnum="${apnum}".strip()
 data=json.load(open(cfg,"r",encoding="utf-8"))
 aps=data.setdefault("apartamentos",[])
-if any(a.get("numero")== "${apnum}" for a in aps):
+if any(str(a.get("numero","")).strip()==apnum for a in aps):
     print("Já existe.")
 else:
-    aps.append({"numero":"${apnum}","moradores":[]})
+    aps.append({"numero":apnum,"moradores":[]})
     json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
     print("OK: AP criado.")
 PY
@@ -61,30 +122,49 @@ PY
 }
 
 add_morador(){
-  read -r -p "AP (ex: 804): " apnum
-  read -r -p "Ramal SIP (ex: 80401): " ramal
-  read -r -p "Nome (ex: AP804-01): " nome
-  [[ -z "${apnum// }" || -z "${ramal// }" ]] && { echo "Dados inválidos"; return; }
+  echo "Selecione o AP:"
+  list_aps_indexed
+  echo
+  echo "Digite o NÚMERO do AP (ex: 804) ou o ÍNDICE (ex: 2)"
+  read -r -p "AP: " choice
+
+  local apnum
+  apnum="$(resolve_ap_choice "${choice:-}")"
+  if [[ -z "${apnum:-}" ]]; then
+    echo "AP inválido ou não existe."
+    return
+  fi
+
+  echo "AP escolhido: $apnum"
+  read -r -p "Ramal SIP (ex: ${apnum}01): " ramal
+  read -r -p "Nome (ex: AP${apnum}-01): " nome
+  [[ -z "${ramal// }" ]] && { echo "Ramal inválido"; return; }
+  [[ -z "${nome// }" ]] && nome="AP${apnum}-${ramal}"
 
   python3 - <<PY
 import json
 cfg="${CFG}"
+apnum="${apnum}".strip()
+ramal="${ramal}".strip()
+nome="${nome}".strip()
+
 data=json.load(open(cfg,"r",encoding="utf-8"))
 aps=data.setdefault("apartamentos",[])
 ap=None
 for a in aps:
-    if a.get("numero")== "${apnum}":
+    if str(a.get("numero","")).strip()==apnum:
         ap=a; break
 if ap is None:
-    print("AP não existe. Crie primeiro.")
+    print("AP não existe.")
     raise SystemExit(0)
+
 mor=ap.setdefault("moradores",[])
-if any(m.get("ramal")== "${ramal}" for m in mor):
+if any(str(m.get("ramal","")).strip()==ramal for m in mor):
     print("Ramal já existe.")
 else:
-    mor.append({"ramal":"${ramal}","nome":"${nome}","senha":""})
+    mor.append({"ramal":ramal,"nome":nome,"senha":""})
     json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
-    print("OK: morador adicionado (senha será gerada ao aplicar).")
+    print("OK: morador adicionado (senha será gerada ao aplicar configs).")
 PY
   chmod 600 "$CFG" || true
 }
@@ -96,12 +176,13 @@ rm_morador(){
   python3 - <<PY
 import json
 cfg="${CFG}"
+ramal="${ramal}".strip()
 data=json.load(open(cfg,"r",encoding="utf-8"))
 changed=False
 for ap in data.get("apartamentos",[]):
     mor=ap.get("moradores",[])
     before=len(mor)
-    ap["moradores"]=[m for m in mor if m.get("ramal")!="${ramal}"]
+    ap["moradores"]=[m for m in mor if str(m.get("ramal","")).strip()!=ramal]
     if len(ap["moradores"])!=before:
         changed=True
 if changed:
@@ -121,7 +202,7 @@ apply(){
 
 show_secrets(){
   echo "Senhas SIP: $SECRETS"
-  [[ -f "$SECRETS" ]] && (sed -n '1,200p' "$SECRETS" | head -n 150) || echo "Ainda não gerado."
+  [[ -f "$SECRETS" ]] && (sed -n '1,220p' "$SECRETS" | head -n 180) || echo "Ainda não gerado."
   echo
   echo "AMI/ARI: $INTEG_TXT"
   [[ -f "$INTEG_TXT" ]] && cat "$INTEG_TXT" || true
