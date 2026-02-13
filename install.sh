@@ -4,6 +4,10 @@ set -euo pipefail
 # =========================
 # INTERFONE • INSTALL (Debian 13)
 # Asterisk (source) + PJSIP + Dialplan gerado do condo.json
+#
+# FIX CRÍTICO (Linphone / REGISTER):
+#  - endpoint_identifier_order=auth_username,username,ip
+#    (evita "No matching endpoint found")
 # =========================
 
 APP_DIR="/opt/interfone"
@@ -23,9 +27,7 @@ log(){ echo -e "[INFO] $*"; }
 warn(){ echo -e "[WARN] $*" >&2; }
 die(){ echo -e "[ERRO] $*" >&2; exit 1; }
 
-need_root(){
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Use: sudo bash install.sh"
-}
+need_root(){ [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "Use: sudo bash install.sh"; }
 
 usage(){
   cat <<'U'
@@ -62,12 +64,9 @@ detect_public_ip(){
 }
 
 find_asterisk_bin(){
-  if command -v asterisk >/dev/null 2>&1; then
-    command -v asterisk
-    return 0
-  fi
-  if [[ -x /usr/sbin/asterisk ]]; then echo "/usr/sbin/asterisk"; return 0; fi
-  if [[ -x /usr/local/sbin/asterisk ]]; then echo "/usr/local/sbin/asterisk"; return 0; fi
+  if command -v asterisk >/dev/null 2>&1; then command -v asterisk; return 0; fi
+  [[ -x /usr/sbin/asterisk ]] && { echo "/usr/sbin/asterisk"; return 0; }
+  [[ -x /usr/local/sbin/asterisk ]] && { echo "/usr/local/sbin/asterisk"; return 0; }
   return 1
 }
 
@@ -177,6 +176,7 @@ build_asterisk_from_source(){
 
   ./configure
 
+  # evita BUILD_NATIVE (VPS virtual às vezes gera binário que não roda)
   if [[ -x menuselect/menuselect ]]; then
     menuselect/menuselect --disable BUILD_NATIVE menuselect.makeopts >/dev/null 2>&1 || true
   fi
@@ -260,6 +260,7 @@ C
 
   [[ -f "$ETC/users.conf" ]] && mv -f "$ETC/users.conf" "$ETC/users.conf.bak" || true
 
+  # AMI/ARI localhost-only
   local AMI_USER AMI_PASS ARI_USER ARI_PASS
   AMI_USER="$(awk '/^  user: /{print $2}' "$INTEG_TXT" | head -n1)"
   AMI_PASS="$(awk '/^  pass: /{print $2}' "$INTEG_TXT" | head -n1)"
@@ -304,7 +305,6 @@ generate_pjsip_and_dialplan(){
   local VPS_IP="$1"
   local ETC="/etc/asterisk"
 
-  # QUOTED heredoc: bash NÃO expande ${EXTEN}
   python3 - "$CFG" "$SECRETS" "$VPS_IP" "$ETC" <<'PY'
 import json, secrets, string, sys, os
 
@@ -326,18 +326,18 @@ for ap in data.get("apartamentos", []):
             m["senha"] = gen_pass()
 
 # =========================
-# PJSIP
-# - AOR = RAMAL (1001) -> compatível com Linphone
-# - ENDPOINT = ep-<ramal> (ep-1001)
-# - AUTH = auth-<ramal>
-# - identify_by=auth_username (evita pegadinha REGISTER sem user no Request-URI)
+# PJSIP (FIX Linphone)
+# - AOR = RAMAL (10001)
+# - ENDPOINT = ep-<ramal> (ep-10001)
+# - endpoint_identifier_order = auth_username,username,ip
 # =========================
 p=[]
 p.append("; INTERFONE - GERADO AUTOMATICAMENTE\n\n")
 
 p.append("[global]\n")
 p.append("type=global\n")
-p.append("user_agent=InterfonePBX/1.0\n\n")
+p.append("user_agent=InterfonePBX/1.0\n")
+p.append("endpoint_identifier_order=auth_username,username,ip\n\n")
 
 p.append("[transport-udp]\n")
 p.append("type=transport\nprotocol=udp\nbind=0.0.0.0:5060\n")
@@ -350,7 +350,8 @@ p.append("transport=transport-udp\n")
 p.append("disallow=all\nallow=ulaw,alaw\n")
 p.append("direct_media=no\nrtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\n")
 p.append("timers=yes\nlanguage=pt_BR\n")
-p.append("identify_by=auth_username\n\n")
+p.append("identify_by=auth_username\n")
+p.append("allow_unauthenticated_options=no\n\n")
 
 p.append("[aor-common](!)\n")
 p.append("type=aor\nmax_contacts=5\nremove_existing=yes\nqualify_frequency=30\n\n")
@@ -362,28 +363,20 @@ def add_user(ramal, nome, senha, context):
     ramal = str(ramal).strip()
     if not ramal:
         return
-
-    aor = ramal                 # AOR = ramal (IMPORTANTE)
-    endpoint = f"ep-{ramal}"     # endpoint interno
+    aor = ramal
+    endpoint = f"ep-{ramal}"
     auth = f"auth-{ramal}"
 
-    # AOR
     p.append(f"[{aor}](aor-common)\n\n")
-
-    # AUTH
     p.append(f"[{auth}](auth-common)\nusername={ramal}\npassword={senha}\n\n")
-
-    # ENDPOINT
     p.append(f"[{endpoint}](endpoint-common)\n")
     p.append(f"context={context}\n")
     p.append(f"auth={auth}\n")
     p.append(f"aors={aor}\n")
     p.append(f"callerid=\"{nome}\" <{ramal}>\n\n")
 
-# Portaria
+# Portaria + Moradores
 add_user(data["portaria"]["ramal"], data["portaria"].get("nome","PORTARIA"), data["portaria"]["senha"], "from-portaria")
-
-# Moradores
 for ap in data.get("apartamentos", []):
     for m in ap.get("moradores", []):
         add_user(m.get("ramal",""), m.get("nome", f"AP{ap.get('numero','')}"), m.get("senha",""), "from-internal")
@@ -392,9 +385,9 @@ open(os.path.join(ETC, "pjsip.conf"), "w", encoding="utf-8").write("".join(p))
 
 # =========================
 # DIALPLAN
-# - Portaria chama AP (100/101) e toca todos moradores do AP
-# - Moradores chamam portaria discando 1000
-# - Também permite discar diretamente um ramal (1001/10101...)
+# - Discar AP (100/101) toca todos moradores do AP
+# - Discar ramal direto (10001/10101...)
+# - Morador disca 1000 para portaria
 # =========================
 e=[]
 e.append("; INTERFONE - GERADO AUTOMATICAMENTE\n\n")
@@ -405,7 +398,6 @@ e.append("exten => _X.,1,Goto(route,${EXTEN},1)\n\n")
 e.append("[from-internal]\n")
 e.append("exten => _X.,1,Goto(route,${EXTEN},1)\n\n")
 
-# Router: tenta AP, depois ramal direto, senão encerra
 e.append("[route]\n")
 e.append("exten => _X.,1,NoOp(ROUTE ${EXTEN})\n")
 e.append(" same => n,GotoIf($[${DIALPLAN_EXISTS(apartments,${EXTEN},1)}]?apartments,${EXTEN},1)\n")
@@ -413,10 +405,7 @@ e.append(" same => n,GotoIf($[${DIALPLAN_EXISTS(extens,${EXTEN},1)}]?extens,${EX
 e.append(" same => n,Playback(invalid)\n")
 e.append(" same => n,Hangup()\n\n")
 
-# Ramais diretos
 e.append("[extens]\n")
-
-# Portaria discável também
 port_r = str(data.get("portaria", {}).get("ramal", "1000")).strip() or "1000"
 e.append(f"exten => {port_r},1,NoOp(CHAMANDO PORTARIA)\n")
 e.append(f" same => n,Dial(PJSIP/ep-{port_r},30)\n")
@@ -434,7 +423,6 @@ for r in sorted(ramais):
     e.append(f" same => n,Dial(PJSIP/ep-{r},30)\n")
     e.append(" same => n,Hangup()\n\n")
 
-# Apartamentos: discar AP chama todos moradores
 e.append("[apartments]\n")
 for ap in data.get("apartamentos", []):
     apnum=str(ap.get("numero","")).strip()
@@ -449,7 +437,6 @@ for ap in data.get("apartamentos", []):
 
 open(os.path.join(ETC, "extensions.conf"), "w", encoding="utf-8").write("".join(e))
 
-# Persistência
 json.dump(data, open(SECRETS, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 json.dump(data, open(CFG, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 
@@ -492,26 +479,15 @@ restart_and_wait(){
 
   local i
   for i in {1..30}; do
-    if systemctl is-active --quiet asterisk; then
-      break
-    fi
+    systemctl is-active --quiet asterisk && break
     sleep 0.4
   done
 
-  if ! systemctl is-active --quiet asterisk; then
-    dump_failure
-    die "Asterisk não ficou ACTIVE."
-  fi
+  systemctl is-active --quiet asterisk || { dump_failure; die "Asterisk não ficou ACTIVE."; }
 
   for i in {1..30}; do
-    if "${AST_BIN}" -rx "core show version" >/dev/null 2>&1; then
-      log "Asterisk OK e respondendo."
-      return 0
-    fi
-    if sudo -u asterisk "${AST_BIN}" -rx "core show version" >/dev/null 2>&1; then
-      log "Asterisk OK e respondendo (como usuário asterisk)."
-      return 0
-    fi
+    "${AST_BIN}" -rx "core show version" >/dev/null 2>&1 && { log "Asterisk OK e respondendo."; return 0; }
+    sudo -u asterisk "${AST_BIN}" -rx "core show version" >/dev/null 2>&1 && { log "Asterisk OK e respondendo (como usuário asterisk)."; return 0; }
     sleep 0.4
   done
 
@@ -562,7 +538,6 @@ main(){
   echo "Testes:"
   echo "  asterisk -rx \"pjsip show endpoints\""
   echo "  asterisk -rx \"pjsip show contacts\""
-  echo "  asterisk -rx \"pjsip show endpoint ep-1001\""
   echo "==================================================================="
 }
 
