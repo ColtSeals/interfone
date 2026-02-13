@@ -1,10 +1,10 @@
-# Interfone Tactical (SIP) — Gerenciador de Chamadas para Condomínio
+# Interfone Tactical (SIP) — Gerenciador de Chamadas de Condomínio
 
-**Interfone Tactical** é um gerenciador leve para “interfone” usando **Asterisk + PJSIP**.
-Você cadastra **APs** e **moradores (1 SIP por pessoa)**, escolhe a estratégia de toque por AP e o sistema
-gera automaticamente os arquivos do Asterisk.
+O **Interfone Tactical** é um gerenciador leve de chamadas SIP para condomínios usando **Asterisk + PJSIP**.
+Ele permite **vários moradores por AP** (um SIP por pessoa), define **estratégia de chamada por AP**,
+e oferece um **dashboard tático ao vivo** (Online / Busy).
 
-> **Privacidade:** o sistema só acompanha **presença SIP** (Online) e **estado de ligação** (Busy). Não grava áudio.
+> Privacidade: acompanha apenas presença SIP e estado de chamada (não grava conteúdo).
 
 ---
 
@@ -12,49 +12,39 @@ gera automaticamente os arquivos do Asterisk.
 
 - **AP (unidade) → vários moradores (SIP por pessoa)**
 - Estratégia por AP:
-  - **`sequential` (cascata / hunt):** chama um por vez (prioridade + divisão de tempo)
-  - **`parallel` (ringall):** chama todos ao mesmo tempo
-- **Dashboard tático ao vivo**:
-  - **Online** = SIP registrado (`Avail`)
-  - **Busy** = em ligação (canal ativo)
-- Gera configs do Asterisk:
+  - `sequential` (cascata / hunt): chama um por um (prioridade por ordem)
+  - `parallel` (ringall): chama todos ao mesmo tempo
+- **Dashboard tático ao vivo**
+  - Online = SIP registrado (`Avail` em `pjsip show contacts`)
+  - Busy = ramal com canal ativo (em ligação)
+- Gera configs automaticamente:
   - `/etc/asterisk/pjsip_users.conf`
   - `/etc/asterisk/extensions_users.conf`
-- **Portaria (ramal 1000)** gerada automaticamente (você pode trocar a senha no painel)
+- Base pronta (criada pelo setup):
+  - `/etc/asterisk/pjsip.conf` (inclui `pjsip_users.conf`)
+  - `/etc/asterisk/extensions.conf` (inclui `extensions_users.conf` no contexto `interfone-ctx`)
 
 ---
 
-## O que significa a “Estratégia”?
+## Como funciona a Estratégia
 
-### sequential (cascata / hunt)
-O ramal do AP toca **um morador por vez**, na ordem da **prioridade** (menor = toca antes).
-O tempo total do toque (`ring_seconds`) é dividido entre os moradores.
+### `sequential` (cascata)
+Ao ligar para o **ramal do AP** (ex.: `101`), ele chama os moradores **um por um**, na ordem cadastrada.
+O tempo total (ex.: 20s) é dividido entre eles.
 
-Exemplo:
-- 3 moradores
-- ring_seconds = 21
-- cada um toca ~7s (até alguém atender)
-
-✅ Bom quando você quer evitar tocar todo mundo ao mesmo tempo.
-
-### parallel (ringall)
-O ramal do AP toca **todos os moradores ao mesmo tempo** por `ring_seconds`.
-Quem atender primeiro assume a chamada.
-
-✅ Bom quando o objetivo é alguém atender rápido.
+### `parallel` (ringall)
+Ao ligar para o **ramal do AP** (ex.: `101`), ele chama **todos ao mesmo tempo**.
+Quem atender primeiro assume a ligação.
 
 ---
 
 ## Instalação (Debian 13)
 
-> Recomendado usar VPS limpa/formatada.
-
 ```bash
 apt update -y && apt install -y git
-git clone https://github.com/ColtSeals/interfone.git
+rm -rf interfone
+git clone https://github.com/SEU_USUARIO/interfone.git
 cd interfone
 chmod +x setup.sh
-./setup.sh
-
-# roda o painel
+sudo ./setup.sh
 interfone
