@@ -43,8 +43,8 @@ Quem atender primeiro assume a ligação.
 ```bash
 apt update -y && apt install -y git
 rm -rf interfone
-git clone https://github.com/SEU_USUARIO/interfone.git
+git clone https://github.com/ColtSeals/interfone.git interfone
 cd interfone
-chmod +x setup.sh
-sudo ./setup.sh
-interfone
+chmod +x install.sh menu.sh
+sudo bash install.sh
+sudo bash menu.sh
