@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+    #!/usr/bin/env bash
 set -euo pipefail
 
 # ==========================================================
@@ -167,6 +167,23 @@ ensure_asterisk_user(){
   chown -R asterisk:asterisk /var/lib/asterisk /var/log/asterisk /var/spool/asterisk /var/run/asterisk 2>/dev/null || true
 }
 
+fix_gen_perms(){
+  # CRÍTICO: Asterisk roda como user=asterisk e precisa LER os includes gerados.
+  install -d "$GEN_DIR"
+  chown root:asterisk "$GEN_DIR"
+  chmod 750 "$GEN_DIR"
+
+  # arquivos podem ser root:asterisk (root escreve, asterisk lê)
+  # se ainda não existem, ok.
+  if compgen -G "$GEN_DIR/*.conf" >/dev/null 2>&1; then
+    chown root:asterisk "$GEN_DIR"/*.conf || true
+    chmod 640 "$GEN_DIR"/*.conf || true
+  fi
+
+  # compat: se algum include antigo apontar outro nome, mantém link
+  ln -sf "$PJSIP_GEN" "$GEN_DIR/pjsip.interfone.generated.conf" 2>/dev/null || true
+}
+
 install_deps(){
   log "Instalando dependências..."
   apt update -y
@@ -267,7 +284,6 @@ write_logger_and_cdr(){
   install -d "$ETC"
   install -d /var/log/asterisk/cdr-csv
 
-  # LOGS
   cat > "$ETC/logger.conf" <<'C'
 [general]
 dateformat=%F %T
@@ -278,7 +294,6 @@ security => security
 console => notice,warning,error,verbose
 C
 
-  # CDR CSV (histórico de chamadas)
   cat > "$ETC/cdr.conf" <<'C'
 [general]
 enable=yes
@@ -295,12 +310,10 @@ loguniqueid=yes
 accountlogs=yes
 C
 
-  # permissões corretas (evita Permission denied)
   chown -R asterisk:asterisk /var/log/asterisk
   chmod 750 /var/log/asterisk
   chmod 750 /var/log/asterisk/cdr-csv
 
-  # logrotate (CDR cresce rápido)
   cat > /etc/logrotate.d/interfone-cdr <<'C'
 /var/log/asterisk/cdr-csv/Master.csv {
   daily
@@ -317,11 +330,9 @@ C
 write_static_confs(){
   local ETC="/etc/asterisk"
   install -d "$ETC"
-  install -d "$GEN_DIR"
-
+  fix_gen_perms
   write_logger_and_cdr
 
-  # RTP + NAT-friendly + ICE (lado Asterisk)
   cat > "$ETC/rtp.conf" <<'C'
 [general]
 rtpstart=10000
@@ -330,7 +341,6 @@ icesupport=yes
 stunaddr=
 C
 
-  # módulos: sem chan_sip
   cat > "$ETC/modules.conf" <<'C'
 [modules]
 autoload=yes
@@ -380,7 +390,7 @@ password=$ARI_PASS
 EOF
 
   # include gerados
-  grep -q "interfone.generated" "$ETC/pjsip.conf" 2>/dev/null || {
+  grep -q "pjsip.interfone.generated.conf" "$ETC/pjsip.conf" 2>/dev/null || {
     [[ -f "$ETC/pjsip.conf" ]] || echo "; base pjsip" > "$ETC/pjsip.conf"
     cat >> "$ETC/pjsip.conf" <<EOF
 
@@ -389,7 +399,7 @@ EOF
 EOF
   }
 
-  grep -q "extensions.interfone.generated" "$ETC/extensions.conf" 2>/dev/null || {
+  grep -q "extensions.interfone.generated.conf" "$ETC/extensions.conf" 2>/dev/null || {
     [[ -f "$ETC/extensions.conf" ]] || echo "; base extensions" > "$ETC/extensions.conf"
     cat >> "$ETC/extensions.conf" <<EOF
 
@@ -401,6 +411,9 @@ EOF
 
 generate_all(){
   local VPS_IP="$1"
+
+  fix_gen_perms
+
   python3 - "$CFG" "$SECRETS" "$VPS_IP" "$GEN_DIR" <<'PY'
 import json, secrets, string, sys, os, re, datetime
 
@@ -476,19 +489,16 @@ p.append("type=global\n")
 p.append("user_agent=InterfonePBX/2.0\n")
 p.append("endpoint_identifier_order=auth_username,username,ip\n\n")
 
-# UDP
 p.append("[transport-udp]\n")
 p.append("type=transport\nprotocol=udp\nbind=0.0.0.0:5060\n")
 p.append(f"external_signaling_address={VPS_IP}\nexternal_media_address={VPS_IP}\n")
 p.append("local_net=10.0.0.0/8\nlocal_net=172.16.0.0/12\nlocal_net=192.168.0.0/16\n\n")
 
-# TCP
 p.append("[transport-tcp]\n")
 p.append("type=transport\nprotocol=tcp\nbind=0.0.0.0:5060\n")
 p.append(f"external_signaling_address={VPS_IP}\nexternal_media_address={VPS_IP}\n")
 p.append("local_net=10.0.0.0/8\nlocal_net=172.16.0.0/12\nlocal_net=192.168.0.0/16\n\n")
 
-# Template robusto (NAT + vídeo)
 p.append("[endpoint-common](!)\n")
 p.append("type=endpoint\n")
 p.append("transport=transport-udp\n")
@@ -523,10 +533,7 @@ def add_user(ramal, nome, senha, context):
     p.append(f"callerid=\"{nome}\" <{ramal}>\n")
     p.append("identify_by=auth_username,username\n\n")
 
-# Portaria
 add_user(PORT_R, data["portaria"].get("nome","PORTARIA"), data["portaria"]["senha"], "from-interfone")
-
-# Moradores
 for r, meta in sorted(ramais.items(), key=lambda x: x[0]):
     add_user(r, meta["nome"], meta["obj"]["senha"], "from-interfone")
 
@@ -548,14 +555,12 @@ e.append(" same => n,Set(__IF_CALLER_OK=0)\n")
 e.append(" same => n,Set(__IF_CALLER_NAME=UNKNOWN)\n")
 e.append(" same => n,Set(__IF_CALLER_TYPE=UNKNOWN)\n")
 
-# portaria?
 e.append(f' same => n,GotoIf($["{PORT_R}"="${{CALLERID(num)}}"]?is_portaria:chk_res)\n')
 e.append(" same => n(is_portaria),Set(__IF_CALLER_TYPE=PORTARIA)\n")
 e.append(f" same => n,Set(__IF_CALLER_NAME={data['portaria'].get('nome','PORTARIA')})\n")
 e.append(f" same => n,Set(__IF_CALLER_OK={'1' if is_active(data['portaria']) else '0'})\n")
 e.append(" same => n,Goto(chk_ok)\n")
 
-# residents
 e.append(" same => n(chk_res),NoOp(CALLER resident check)\n")
 for r in sorted(ramais.keys()):
     meta = ramais[r]
@@ -578,14 +583,12 @@ e.append(" same => n(reject),NoOp(REJECT caller=${CALLERID(num)} inactive/expire
 e.append(" same => n,Playback(ss-noservice)\n")
 e.append(" same => n,Hangup(403)\n\n")
 
-# route destination
 e.append("[route_dest]\n")
 e.append("exten => _X.,1,NoOp(DEST ${EXTEN})\n")
 
 dest_ramais = set([PORT_R] + list(ramais.keys()))
 dest_aps = set(str(a.get("numero","")).strip() for a in data.get("apartamentos",[]) if str(a.get("numero","")).strip())
 
-# can_call por ramal
 allow_rr = bool(policy.get("allow_resident_to_resident", False))
 caller_can_call = {}
 for r, meta in ramais.items():
@@ -598,7 +601,6 @@ for r, meta in ramais.items():
         allowed.append(str(d))
     caller_can_call[r] = allowed
 
-# destino apartamento (AP): portaria sempre; morador só se explicitamente "AP:xxx"
 for ap in sorted(dest_aps, key=lambda x: int(x)):
     e.append(f"exten => {ap},1,NoOp(AP {ap} ringgroup)\n")
     e.append(f" same => n,GotoIf($[\"${{IF_CALLER_TYPE}}\"=\"PORTARIA\"]?do_ap_{ap}:chk_ap_policy_{ap})\n")
@@ -630,7 +632,6 @@ for ap in sorted(dest_aps, key=lambda x: int(x)):
         e.append(" same => n,Playback(vm-nobodyavail)\n")
     e.append(" same => n,Hangup()\n\n")
 
-# destino ramal
 for ext in sorted(dest_ramais, key=lambda x: int(x)):
     e.append(f"exten => {ext},1,NoOp(CALL RAMAL {ext})\n")
     e.append(f" same => n,GotoIf($[\"${{IF_CALLER_TYPE}}\"=\"PORTARIA\"]?do_call_{ext}:chk_policy_{ext})\n")
@@ -660,23 +661,23 @@ for ext in sorted(dest_ramais, key=lambda x: int(x)):
     e.append(f" same => n,Dial(PJSIP/{ext},30,tT)\n")
     e.append(" same => n,Hangup()\n\n")
 
-# fallback
 e.append("exten => _X.,1,NoOp(DEST inválido)\n")
 e.append(" same => n,Playback(invalid)\n")
 e.append(" same => n,Hangup()\n\n")
 
 open(os.path.join(GEN_DIR, "extensions.interfone.generated.conf"), "w", encoding="utf-8").write("".join(e))
 
-# salva secrets (inclui senhas geradas) e normaliza CFG
 json.dump(data, open(SECRETS, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 json.dump(data, open(CFG, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 print("OK: gerado", os.path.join(GEN_DIR,"pjsip.interfone.generated.conf"), "e", os.path.join(GEN_DIR,"extensions.interfone.generated.conf"))
 PY
 
+  # CFG/SECRETS continuam privados
   chmod 600 "$CFG" || true
   chmod 600 "$SECRETS" || true
-  chmod 700 "$GEN_DIR" || true
-  chown -R root:root "$GEN_DIR" || true
+
+  # gerados: leitura pelo asterisk (CRÍTICO)
+  fix_gen_perms
 }
 
 install_guard(){
@@ -686,7 +687,6 @@ install_guard(){
 #!/usr/bin/env python3
 import os, sys, subprocess, hashlib, datetime
 
-CFG="/opt/interfone/condo.json"
 GEN_DIR="/etc/asterisk/interfone"
 PJSIP_GEN=os.path.join(GEN_DIR,"pjsip.interfone.generated.conf")
 EXT_GEN=os.path.join(GEN_DIR,"extensions.interfone.generated.conf")
@@ -706,7 +706,7 @@ def main():
     after = (sha256(PJSIP_GEN), sha256(EXT_GEN))
 
     if r.returncode != 0:
-        print("apply failed:", r.stderr.strip(), file=sys.stderr)
+        print("apply failed:", (r.stderr or "").strip(), file=sys.stderr)
         sys.exit(1)
 
     if before != after:
@@ -725,13 +725,28 @@ if __name__=="__main__":
 PY
   chmod 755 "$GUARD_PY"
 
-  # wrapper apply
+  # wrapper apply: SEMPRE ajusta perms no final
   cat > /usr/local/sbin/interfone-apply <<'B'
 #!/usr/bin/env bash
 set -euo pipefail
+
 CFG="/opt/interfone/condo.json"
 SECRETS="/root/interfone-secrets.json"
+
 GEN_DIR="/etc/asterisk/interfone"
+PJSIP_GEN="$GEN_DIR/pjsip.interfone.generated.conf"
+EXT_GEN="$GEN_DIR/extensions.interfone.generated.conf"
+
+fix_perms(){
+  install -d "$GEN_DIR"
+  chown root:asterisk "$GEN_DIR"
+  chmod 750 "$GEN_DIR"
+  if compgen -G "$GEN_DIR/*.conf" >/dev/null 2>&1; then
+    chown root:asterisk "$GEN_DIR"/*.conf || true
+    chmod 640 "$GEN_DIR"/*.conf || true
+  fi
+  ln -sf "$PJSIP_GEN" "$GEN_DIR/pjsip.interfone.generated.conf" 2>/dev/null || true
+}
 
 detect_ip(){
   local ip=""
@@ -746,8 +761,7 @@ detect_ip(){
 }
 
 VPS_IP="$(detect_ip)"
-mkdir -p "$GEN_DIR"
-chmod 700 "$GEN_DIR"
+fix_perms
 
 python3 - "$CFG" "$SECRETS" "$VPS_IP" "$GEN_DIR" <<'PY'
 import json, secrets, string, sys, os, re, datetime
@@ -856,7 +870,7 @@ for r, meta in sorted(ramais.items(), key=lambda x: x[0]):
 
 open(os.path.join(GEN_DIR,"pjsip.interfone.generated.conf"),"w",encoding="utf-8").write("".join(p))
 
-# DIALPLAN
+# DIALPLAN (mesma versão do install principal)
 e=[]
 e.append("; INTERFONE - GERADO AUTOMATICAMENTE\n\n")
 e.append("[from-interfone]\n")
@@ -867,6 +881,7 @@ e.append(" same => n,Goto(interfone-route,${EXTEN},1)\n\n")
 e.append("[interfone-route]\n")
 e.append("exten => _X.,1,NoOp(ROUTE ${CALLERID(num)} -> ${EXTEN})\n")
 e.append(" same => n,Set(__IF_CALLER_OK=0)\n")
+e.append(" same => n,Set(__IF_CALLER_NAME=UNKNOWN)\n")
 e.append(" same => n,Set(__IF_CALLER_TYPE=UNKNOWN)\n")
 e.append(f' same => n,GotoIf($["{PORT_R}"="${{CALLERID(num)}}"]?is_portaria:chk_res)\n')
 e.append(" same => n(is_portaria),Set(__IF_CALLER_TYPE=PORTARIA)\n")
@@ -878,7 +893,6 @@ for r, meta in sorted(ramais.items(), key=lambda x: x[0]):
     apnum = meta["ap"]
     ap_obj = next((a for a in data.get("apartamentos",[]) if str(a.get("numero","")).strip()==apnum), {})
     ok = is_active(meta["obj"]) and is_active(ap_obj)
-
     e.append(f' same => n,GotoIf($["{r}"="${{CALLERID(num)}}"]?caller_{r}:nextcaller_{r})\n')
     e.append(f" same => n(caller_{r}),Set(__IF_CALLER_TYPE=RESIDENT)\n")
     e.append(f" same => n,Set(__IF_CALLER_OK={'1' if ok else '0'})\n")
@@ -896,7 +910,18 @@ e.append("exten => _X.,1,NoOp(DEST ${EXTEN})\n")
 dest_ramais=set([PORT_R]+list(ramais.keys()))
 dest_aps=set(str(a.get("numero","")).strip() for a in data.get("apartamentos",[]) if str(a.get("numero","")).strip())
 
-# AP calls: só portaria por default
+allow_rr = bool(policy.get("allow_resident_to_resident", False))
+caller_can = {}
+for r, meta in ramais.items():
+    allowed=[]
+    for d in policy.get("default_resident_can_call", ["PORTARIA"]):
+        allowed.append(str(d))
+    if allow_rr:
+        allowed.append("RESIDENTS")
+    for d in meta["obj"].get("can_call", []) or []:
+        allowed.append(str(d))
+    caller_can[r]=set(allowed)
+
 for ap in sorted(dest_aps, key=lambda x: int(x)):
     e.append(f"exten => {ap},1,NoOp(AP {ap} ringgroup)\n")
     e.append(f" same => n,GotoIf($[\"${{IF_CALLER_TYPE}}\"=\"PORTARIA\"]?do_ap_{ap}:deny_ap_{ap})\n")
@@ -914,25 +939,10 @@ for ap in sorted(dest_aps, key=lambda x: int(x)):
     e.append(f" same => n(deny_ap_{ap}),Playback(permission-denied)\n")
     e.append(" same => n,Hangup(403)\n\n")
 
-# Ramal calls
-allow_rr = bool(policy.get("allow_resident_to_resident", False))
-
-caller_can = {}
-for r, meta in ramais.items():
-    allowed=[]
-    for d in policy.get("default_resident_can_call", ["PORTARIA"]):
-        allowed.append(str(d))
-    if allow_rr:
-        allowed.append("RESIDENTS")
-    for d in meta["obj"].get("can_call", []) or []:
-        allowed.append(str(d))
-    caller_can[r]=set(allowed)
-
 for ext in sorted(dest_ramais, key=lambda x: int(x)):
     e.append(f"exten => {ext},1,NoOp(CALL RAMAL {ext})\n")
     e.append(f" same => n,GotoIf($[\"${{IF_CALLER_TYPE}}\"=\"PORTARIA\"]?do_{ext}:chk_{ext})\n")
     e.append(f" same => n(chk_{ext}),Set(__IF_ALLOWED=0)\n")
-
     if ext == PORT_R:
         e.append(" same => n,Set(__IF_ALLOWED=1)\n")
     else:
@@ -945,7 +955,6 @@ for ext in sorted(dest_ramais, key=lambda x: int(x)):
                     e.append(f" same => n(allow_{ext}),Set(__IF_ALLOWED=1)\n")
                     e.append(f" same => n,Goto(go_{ext})\n")
                     e.append(f" same => n(next_{ext}_{r}),NoOp(.)\n")
-
     e.append(f" same => n,GotoIf($[${{IF_ALLOWED}}=1]?go_{ext}:deny_{ext})\n")
     e.append(f" same => n(deny_{ext}),Playback(permission-denied)\n")
     e.append(" same => n,Hangup(403)\n")
@@ -962,6 +971,7 @@ print("OK apply")
 PY
 
 chmod 600 "$CFG" "$SECRETS" 2>/dev/null || true
+fix_perms
 exit 0
 B
   chmod 755 /usr/local/sbin/interfone-apply
@@ -1107,4 +1117,4 @@ main(){
   echo "==================================================================="
 }
 
-main "$@"
+main "$@"                
