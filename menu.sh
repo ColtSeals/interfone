@@ -2,20 +2,22 @@
 set -euo pipefail
 
 # ==============================================================================
-# INTERFONE • SUPER MENU (SIP CORE) — v2 (PRO)
+# INTERFONE • SUPER MENU (SIP CORE) — v2 (PRO) [ATUALIZADO]
 # - Dashboard rico + data/hora (dd/mm/aaaa HH:MM:SS)
 # - Tabela ramais (🟢 online / 🔴 offline / 🟡 busy) + filtros (ativos/vencidos)
 # - Wizard AP + N moradores (com senha)
-# - Ativar/Inativar ramal (bloco) + Validade (expira)
-# - Política de chamadas (quem fala com quem) — simples e segura
+# - Ativar/Inativar ramal (bloco) + Validade (expires_at)
+# - Política de chamadas (policy v2):
+#     * policy.default_resident_can_call: ["PORTARIA", ...]
+#     * policy.allow_resident_to_resident: true/false
+#     * morador.can_call: ["RAMAL:1000", "AP:101", ...]
 # - Apply/restart/logs/health-check
 # - Monitor LIVE de tentativas LOGIN/REGISTER
 # - Relatório de chamadas (CDR) — últimos registros
 #
 # Obs:
-# 1) Este menu edita o condo.json e chama o install.sh (apply-only) para efetivar.
-# 2) As regras (UFW) podem ser aplicadas via opção "Aplicar segurança de rede"
-#    sem ficar exibindo detalhes técnicos no menu.
+# 1) Este menu edita o condo.json e chama /usr/local/sbin/interfone-apply (preferencial)
+# 2) Também suporta ./install.sh --apply-only se você rodar dentro do repo
 # ==============================================================================
 
 APP_DIR="/opt/interfone"
@@ -84,20 +86,32 @@ ensure_cfg_exists(){
   if [[ ! -f "$CFG" ]]; then
     cat > "$CFG" <<'JSON'
 {
-  "portaria": { "ramal": "1000", "nome": "PORTARIA", "senha": "", "active": true, "valid_until": "" },
   "policy": {
-    "resident_to_portaria": true,
-    "portaria_to_resident": true,
-    "resident_to_resident_same_ap": false,
-    "resident_to_resident_any": false
+    "default_resident_can_call": ["PORTARIA"],
+    "allow_resident_to_resident": false
+  },
+  "portaria": {
+    "ramal": "1000",
+    "nome": "PORTARIA",
+    "senha": "",
+    "active": true,
+    "expires_at": null
   },
   "apartamentos": [
     {
       "numero": "101",
       "nome": "",
+      "active": true,
+      "expires_at": null,
       "moradores": [
-        { "ramal": "10101", "nome": "AP101-01", "senha": "", "active": true, "valid_until": "" },
-        { "ramal": "10102", "nome": "AP101-02", "senha": "", "active": true, "valid_until": "" }
+        {
+          "ramal": "10101",
+          "nome": "AP101-01",
+          "senha": "",
+          "active": true,
+          "expires_at": null,
+          "can_call": []
+        }
       ]
     }
   ]
@@ -180,32 +194,85 @@ PY
 py(){ python3 - "$@"; }
 
 json_defaults_upgrade(){
-  # garante campos novos sem quebrar configs antigas
+  # Upgrade automático:
+  # - valid_until (antigo) -> expires_at (novo ISO)
+  # - policy antiga booleana -> policy nova (default_resident_can_call / allow_resident_to_resident)
+  # - garante can_call em moradores e flags em AP
   py <<PY
-import json
+import json, re
+from datetime import datetime
+
 cfg="${CFG}"
 data=json.load(open(cfg,"r",encoding="utf-8"))
 
+def to_iso(vu):
+    if vu is None: return None
+    vu=str(vu).strip()
+    if not vu: return None
+    # aceita "YYYY-MM-DD HH:MM:SS" (antigo) -> "YYYY-MM-DDTHH:MM:SS"
+    try:
+        dt=datetime.strptime(vu, "%Y-%m-%d %H:%M:%S")
+        return dt.strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        # se já tiver T, tenta fromisoformat
+        try:
+            dt=datetime.fromisoformat(vu.replace("Z",""))
+            return dt.strftime("%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            return None
+
+# policy nova
 data.setdefault("policy", {})
 pol=data["policy"]
-pol.setdefault("resident_to_portaria", True)
-pol.setdefault("portaria_to_resident", True)
-pol.setdefault("resident_to_resident_same_ap", False)
-pol.setdefault("resident_to_resident_any", False)
 
+# Se ainda existe policy antiga (resident_to_portaria etc.), converte para v2
+legacy_keys={"resident_to_portaria","portaria_to_resident","resident_to_resident_same_ap","resident_to_resident_any"}
+if any(k in pol for k in legacy_keys):
+    r2p=bool(pol.get("resident_to_portaria", True))
+    rr_any=bool(pol.get("resident_to_resident_any", False))
+    # policy v2
+    pol2={}
+    pol2["default_resident_can_call"] = ["PORTARIA"] if r2p else []
+    pol2["allow_resident_to_resident"] = True if rr_any else False
+    data["policy"]=pol2
+    pol=pol2
+else:
+    pol.setdefault("default_resident_can_call", ["PORTARIA"])
+    pol.setdefault("allow_resident_to_resident", False)
+
+# portaria
 data.setdefault("portaria", {"ramal":"1000","nome":"PORTARIA","senha":""})
 p=data["portaria"]
 p.setdefault("active", True)
-p.setdefault("valid_until", "")
+# migra valid_until -> expires_at (se existir)
+if "expires_at" not in p:
+    p["expires_at"]=to_iso(p.get("valid_until",""))
+p.pop("valid_until", None)
+# normalize null strings
+if isinstance(p.get("expires_at"), str) and p["expires_at"].strip()=="":
+    p["expires_at"]=None
 
+# aps/moradores
 for ap in data.get("apartamentos", []) or []:
     ap.setdefault("nome","")
+    ap.setdefault("active", True)
+    if "expires_at" not in ap:
+        ap["expires_at"]=to_iso(ap.get("valid_until",""))
+    ap.pop("valid_until", None)
+    if isinstance(ap.get("expires_at"), str) and ap["expires_at"].strip()=="":
+        ap["expires_at"]=None
+
     for m in ap.get("moradores", []) or []:
         m.setdefault("active", True)
-        m.setdefault("valid_until", "")
+        if "expires_at" not in m:
+            m["expires_at"]=to_iso(m.get("valid_until",""))
+        m.pop("valid_until", None)
+        if isinstance(m.get("expires_at"), str) and m["expires_at"] and m["expires_at"].strip()=="":
+            m["expires_at"]=None
+        m.setdefault("can_call", [])
 
 json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
-print("OK: condo.json atualizado com defaults.")
+print("OK: condo.json atualizado/migrado para schema novo.")
 PY
   chmod 600 "$CFG" || true
 }
@@ -257,8 +324,8 @@ data=json.load(open("${CFG}","r",encoding="utf-8"))
 
 def state(obj):
     act=bool(obj.get("active", True))
-    vu=str(obj.get("valid_until","")).strip()
-    return ("ATIVO" if act else "INATIVO") + (f" | validade:{vu}" if vu else "")
+    exp=obj.get("expires_at", None)
+    return ("ATIVO" if act else "INATIVO") + (f" | expires_at:{exp}" if exp else "")
 
 p=data.get("portaria",{})
 print("PORTARIA:", p.get("ramal","1000"), "-", p.get("nome","PORTARIA"), "|", state(p))
@@ -267,10 +334,13 @@ for ap in data.get("apartamentos",[]):
     apn=str(ap.get("numero","?")).strip()
     apnome=str(ap.get("nome","")).strip()
     head=f"AP {apn}" + (f" - {apnome}" if apnome else "")
-    print(head)
+    apst=state(ap)
+    print(head, "|", apst)
     for m in ap.get("moradores",[]):
         pw = "SET" if str(m.get("senha","")).strip() else "AUTO"
-        print("  -", m.get("ramal","?"), "|", m.get("nome",""), f"| senha:{pw} | {state(m)}")
+        can = m.get("can_call",[]) or []
+        can_s = ",".join(can) if can else "-"
+        print("  -", m.get("ramal","?"), "|", m.get("nome",""), f"| senha:{pw} | {state(m)} | can_call:{can_s}")
 PY
 }
 
@@ -280,51 +350,91 @@ policy_show(){
 import json
 data=json.load(open("${CFG}","r",encoding="utf-8"))
 p=data.get("policy",{})
-print("POLÍTICA (quem pode ligar para quem):")
-print(" - Morador → Portaria:", "SIM" if p.get("resident_to_portaria",True) else "NÃO")
-print(" - Portaria → Morador:", "SIM" if p.get("portaria_to_resident",True) else "NÃO")
-print(" - Morador → Morador (mesmo AP):", "SIM" if p.get("resident_to_resident_same_ap",False) else "NÃO")
-print(" - Morador → Morador (qualquer):", "SIM" if p.get("resident_to_resident_any",False) else "NÃO")
+d=p.get("default_resident_can_call", ["PORTARIA"])
+rr=bool(p.get("allow_resident_to_resident", False))
+print("POLÍTICA (schema novo):")
+print(" - default_resident_can_call:", d)
+print(" - allow_resident_to_resident:", "SIM" if rr else "NÃO")
+print("")
+print("Dica:")
+print(" - Para permitir morador -> AP específico: adicione em can_call do morador: AP:101")
+print(" - Para permitir morador -> ramal específico: RAMAL:1000 (PORTARIA) ou RAMAL:10102 etc.")
 PY
 }
 
 policy_set(){
   ensure_cfg_exists
-  echo "Defina a política (responda S/N):"
-  local a b c d
+  echo "Defina a política (schema novo):"
+  echo
+  echo "1) Morador só liga para PORTARIA (recomendado)"
+  echo "2) Morador liga para PORTARIA + libera morador->morador (todos)"
+  echo "3) Morador NÃO liga para ninguém por padrão (tudo por can_call)"
+  echo
+  read -r -p "Escolha: " o
 
-  read -r -p "Morador pode ligar para Portaria? [S/n] " a; a="${a:-S}"
-  read -r -p "Portaria pode ligar para Morador? [S/n] " b; b="${b:-S}"
-  read -r -p "Morador pode ligar para Morador do MESMO AP? [s/N] " c; c="${c:-N}"
-  read -r -p "Morador pode ligar para Morador de QUALQUER AP? [s/N] " d; d="${d:-N}"
+  case "$o" in
+    1) local d='["PORTARIA"]'; local rr="false" ;;
+    2) local d='["PORTARIA"]'; local rr="true" ;;
+    3) local d='[]'; local rr="false" ;;
+    *) warn "Opção inválida"; return ;;
+  esac
 
-  py "${a,,}" "${b,,}" "${c,,}" "${d,,}" <<PY
+  py "$d" "$rr" <<PY
 import json, sys
-def yn(x, default=False):
-    x=(x or "").strip().lower()
-    if x in ("s","sim","y","yes","1","true"): return True
-    if x in ("n","nao","não","no","0","false"): return False
-    return default
+import ast as _ast
+cfg="${CFG}"
+data=json.load(open(cfg,"r",encoding="utf-8"))
+pol=data.setdefault("policy", {})
+pol["default_resident_can_call"]=_ast.literal_eval(sys.argv[1])
+pol["allow_resident_to_resident"]=(sys.argv[2].lower()=="true")
+json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
+print("OK: política atualizada. Rode APPLY.")
+PY
+  chmod 600 "$CFG" || true
+}
 
-a=yn(sys.argv[1], True)
-b=yn(sys.argv[2], True)
-c=yn(sys.argv[3], False)
-d=yn(sys.argv[4], False)
+# can_call por morador
+set_can_call(){
+  ensure_cfg_exists
+  read -r -p "Ramal do morador (ex: 10101): " ramal
+  [[ -z "${ramal// }" ]] && { bad "Ramal inválido"; return; }
+
+  echo
+  echo "Configurar can_call desse morador:"
+  echo " - ENTER vazio = limpar lista"
+  echo " - Exemplos:"
+  echo "   AP:101"
+  echo "   RAMAL:1000"
+  echo "   RAMAL:10102"
+  echo
+  read -r -p "can_call (separe por vírgula): " raw
+
+  py "$ramal" "$raw" <<PY
+import json, sys, re
+ramal=sys.argv[1].strip()
+raw=sys.argv[2].strip()
+
+items=[]
+if raw:
+    for part in raw.split(","):
+        x=part.strip()
+        if not x: continue
+        if not (x.startswith("AP:") or x.startswith("RAMAL:") or x=="PORTARIA" or x=="RESIDENTS"):
+            print("Item inválido:", x); raise SystemExit(0)
+        items.append(x)
 
 cfg="${CFG}"
 data=json.load(open(cfg,"r",encoding="utf-8"))
-pol=data.setdefault("policy",{})
-pol["resident_to_portaria"]=a
-pol["portaria_to_resident"]=b
-pol["resident_to_resident_same_ap"]=c
-pol["resident_to_resident_any"]=d
 
-# segurança: se any=true, força same_ap=true (faz sentido)
-if pol["resident_to_resident_any"]:
-    pol["resident_to_resident_same_ap"]=True
+for ap in data.get("apartamentos",[]):
+    for m in ap.get("moradores",[]):
+        if str(m.get("ramal","")).strip()==ramal:
+            m["can_call"]=items
+            json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
+            print("OK: can_call atualizado. Rode APPLY.")
+            raise SystemExit(0)
 
-json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
-print("OK: política atualizada. Rode APPLY.")
+print("Ramal não encontrado (apenas moradores têm can_call).")
 PY
   chmod 600 "$CFG" || true
 }
@@ -373,12 +483,23 @@ aps=data.setdefault("apartamentos",[])
 if any(str(a.get("numero","")).strip()==apnum for a in aps):
     print("Já existe.")
 else:
-    obj={"numero":apnum,"moradores":[],"nome":apname or ""}
+    obj={"numero":apnum,"moradores":[],"nome":apname or "","active":True,"expires_at":None}
     aps.append(obj)
     json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
     print("OK: AP criado.")
 PY
   chmod 600 "$CFG" || true
+}
+
+# ---------- expires_at helpers ----------
+read_expires_input(){
+  echo "Validade (opcional):"
+  echo " - ENTER = sem validade"
+  echo " - Formato 1 (recomendado): AAAA-MM-DD            (vira 23:59:59)"
+  echo " - Formato 2: AAAA-MM-DD HH:MM:SS"
+  echo " - Formato 3: AAAA-MM-DDTHH:MM:SS"
+  read -r -p "expires_at: " exp
+  echo "$exp"
 }
 
 add_morador(){
@@ -406,10 +527,7 @@ add_morador(){
   read -r -p "Nome do morador (ENTER = padrão): " nome
   [[ -z "${nome// }" ]] && nome="AP${apnum}-${ramal}"
 
-  echo "Validade (opcional):"
-  echo " - ENTER = sem validade"
-  echo " - Formato: AAAA-MM-DD HH:MM:SS   (ex: 2026-12-31 23:59:59)"
-  read -r -p "valid_until: " valid_until
+  local exp; exp="$(read_expires_input)"
 
   echo "Senha (6-64 chars; permitido: A-Z a-z 0-9 . _ - @ : + = #)"
   echo "ENTER = gerar automaticamente e salvar no cadastro"
@@ -424,19 +542,27 @@ add_morador(){
     validate_pass "$pass1" || { bad "Senha inválida (tamanho/caracteres)."; return; }
   fi
 
-  py "$apnum" "$ramal" "$nome" "$pass1" "$valid_until" <<PY
-import json, sys, re
+  py "$apnum" "$ramal" "$nome" "$pass1" "$exp" <<PY
+import json, sys, re, datetime
 apnum=sys.argv[1].strip()
 ramal=sys.argv[2].strip()
 nome=sys.argv[3].strip()
 senha=sys.argv[4]
-valid_until=sys.argv[5].strip()
+exp=sys.argv[5].strip()
+
+def norm_exp(s):
+    s=(s or "").strip()
+    if not s: return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}$", s):
+        return s+"T23:59:59"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", s):
+        return s.replace(" ","T")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$", s):
+        return s
+    print("expires_at inválido. Use AAAA-MM-DD ou AAAA-MM-DD HH:MM:SS ou AAAA-MM-DDTHH:MM:SS"); raise SystemExit(0)
 
 if not re.fullmatch(r"\d{2,10}", ramal):
     print("Ramal inválido (use só dígitos, 2..10)."); raise SystemExit(0)
-
-if valid_until and not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", valid_until):
-    print("valid_until inválido. Use AAAA-MM-DD HH:MM:SS"); raise SystemExit(0)
 
 cfg="${CFG}"
 data=json.load(open(cfg,"r",encoding="utf-8"))
@@ -458,7 +584,7 @@ for a in aps:
             print("Ramal já existe em outro AP."); raise SystemExit(0)
 
 mor=ap.setdefault("moradores",[])
-mor.append({"ramal":ramal,"nome":nome,"senha":senha,"active":True,"valid_until":valid_until})
+mor.append({"ramal":ramal,"nome":nome,"senha":senha,"active":True,"expires_at":norm_exp(exp),"can_call":[]})
 json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
 print("OK: morador criado. Rode APPLY para entrar em produção.")
 PY
@@ -509,7 +635,7 @@ import json, sys
 newname=sys.argv[1].strip()
 cfg="${CFG}"
 data=json.load(open(cfg,"r",encoding="utf-8"))
-p=data.setdefault("portaria", {"ramal":"1000","nome":"PORTARIA","senha":"","active":True,"valid_until":""})
+p=data.setdefault("portaria", {"ramal":"1000","nome":"PORTARIA","senha":"","active":True,"expires_at":None})
 p["nome"]=newname
 json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
 print("OK: nome da portaria atualizado. Rode APPLY.")
@@ -685,40 +811,47 @@ PY
   chmod 600 "$CFG" || true
 }
 
-set_valid_until(){
+set_expires_at(){
   ensure_cfg_exists
   read -r -p "Ramal (1000 ou morador): " ramal
   [[ -z "${ramal// }" ]] && { bad "Ramal inválido"; return; }
 
-  echo "valid_until:"
-  echo " - ENTER = remover validade (nunca expira)"
-  echo " - Formato: AAAA-MM-DD HH:MM:SS   (ex: 2026-12-31 23:59:59)"
-  read -r -p "valid_until: " vu
+  local exp; exp="$(read_expires_input)"
 
-  py "$ramal" "$vu" <<PY
+  py "$ramal" "$exp" <<PY
 import json, sys, re
 ramal=sys.argv[1].strip()
-vu=sys.argv[2].strip()
-if vu and not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", vu):
-    print("valid_until inválido. Use AAAA-MM-DD HH:MM:SS"); raise SystemExit(0)
+exp=sys.argv[2].strip()
+
+def norm(s):
+    s=(s or "").strip()
+    if not s: return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}$", s):
+        return s+"T23:59:59"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", s):
+        return s.replace(" ","T")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$", s):
+        return s
+    print("expires_at inválido. Use AAAA-MM-DD ou AAAA-MM-DD HH:MM:SS ou AAAA-MM-DDTHH:MM:SS"); raise SystemExit(0)
 
 cfg="${CFG}"
 data=json.load(open(cfg,"r",encoding="utf-8"))
+val=norm(exp)
 
 p=data.get("portaria",{})
 if str(p.get("ramal","")).strip()==ramal:
-    p["valid_until"]=vu
+    p["expires_at"]=val
     data["portaria"]=p
     json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
-    print("OK: validade da portaria atualizada. Rode APPLY.")
+    print("OK: expires_at da portaria atualizado. Rode APPLY.")
     raise SystemExit(0)
 
 for ap in data.get("apartamentos",[]):
     for m in ap.get("moradores",[]):
         if str(m.get("ramal","")).strip()==ramal:
-            m["valid_until"]=vu
+            m["expires_at"]=val
             json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
-            print("OK: validade do morador atualizada. Rode APPLY.")
+            print("OK: expires_at do morador atualizado. Rode APPLY.")
             raise SystemExit(0)
 
 print("Ramal não encontrado.")
@@ -733,46 +866,67 @@ import json
 from datetime import datetime
 data=json.load(open("${CFG}","r",encoding="utf-8"))
 
-def is_expired(vu):
-    vu=(vu or "").strip()
-    if not vu: return False
+def parse_iso(s):
+    if not s: return None
+    s=str(s).strip()
+    if not s: return None
     try:
-        dt=datetime.strptime(vu, "%Y-%m-%d %H:%M:%S")
-        return dt < datetime.now()
+        return datetime.fromisoformat(s.replace("Z",""))
     except Exception:
-        return True
+        return None
+
+def expired(exp):
+    dt=parse_iso(exp)
+    if not dt: return False
+    return dt < datetime.now()
 
 rows=[]
 p=data.get("portaria",{})
-if is_expired(p.get("valid_until","")):
-    rows.append(("PORTARIA", p.get("ramal","1000"), p.get("nome","PORTARIA"), p.get("valid_until","")))
+if expired(p.get("expires_at")):
+    rows.append(("PORTARIA", p.get("ramal","1000"), p.get("nome","PORTARIA"), p.get("expires_at","")))
 
 for ap in data.get("apartamentos",[]):
     apn=str(ap.get("numero","")).strip()
     for m in ap.get("moradores",[]):
-        if is_expired(m.get("valid_until","")):
-            rows.append((f"AP {apn}", m.get("ramal",""), m.get("nome",""), m.get("valid_until","")))
+        if expired(m.get("expires_at")):
+            rows.append((f"AP {apn}", m.get("ramal",""), m.get("nome",""), m.get("expires_at","")))
 
 print("")
-print("RAMAL(IS) VENCIDOS".center(76))
+print("RAMAIS VENCIDOS (expires_at)".center(76))
 print("-"*76)
 if not rows:
     print("Nenhum vencido.")
 else:
-    print(f"{'LOCAL':<14} {'RAMAL':<10} {'NOME':<28} {'VALID_UNTIL'}")
+    print(f"{'LOCAL':<14} {'RAMAL':<10} {'NOME':<28} {'EXPIRES_AT'}")
     print("-"*76)
-    for loc, r, nm, vu in rows:
-        print(f"{loc:<14} {str(r):<10} {str(nm)[:28]:<28} {vu}")
+    for loc, r, nm, exp in rows:
+        print(f"{loc:<14} {str(r):<10} {str(nm)[:28]:<28} {exp}")
 print("-"*76)
 PY
 }
 
 # ---------- Apply/ops ----------
 apply_configs(){
-  [[ -x ./install.sh ]] || { bad "install.sh não encontrado no diretório atual."; return; }
-  ok "Aplicando configs + reiniciando Asterisk..."
-  bash ./install.sh --apply-only
-  ok "APPLY concluído."
+  # Preferencial: interfone-apply (independente de onde você roda)
+  if [[ -x /usr/local/sbin/interfone-apply ]]; then
+    ok "Aplicando configs (interfone-apply) + reload/restart conforme guard..."
+    /usr/local/sbin/interfone-apply
+    # reinicia asterisk pra garantir (padrão do teu menu)
+    systemctl restart asterisk >/dev/null 2>&1 || true
+    ok "APPLY concluído."
+    return
+  fi
+
+  # fallback: dentro do repo
+  if [[ -x ./install.sh ]]; then
+    ok "Aplicando configs via ./install.sh --apply-only ..."
+    bash ./install.sh --apply-only
+    ok "APPLY concluído."
+    return
+  fi
+
+  bad "Nem /usr/local/sbin/interfone-apply nem ./install.sh foram encontrados."
+  warn "Dica: rode o install.sh uma vez para instalar o interfone-apply."
 }
 
 restart_asterisk(){
@@ -820,9 +974,8 @@ pjsip_logger_toggle(){
   esac
 }
 
-# ---------- Segurança de rede (sem “pontas soltas” no menu) ----------
+# ---------- Segurança de rede ----------
 apply_network_hardening(){
-  # Mantém o menu “limpo”: não fica exibindo portas/regras.
   if ! have ufw; then
     warn "ufw não instalado. Sugestão: apt install -y ufw"
     return
@@ -841,7 +994,7 @@ network_status(){
   ufw status verbose || true
 }
 
-# ---------- CDR / Histórico de chamadas ----------
+# ---------- CDR ----------
 pick_cdr_file(){
   if [[ -f "$CDR_CSV1" ]]; then echo "$CDR_CSV1"; return; fi
   if [[ -f "$CDR_CSV2" ]]; then echo "$CDR_CSV2"; return; fi
@@ -852,7 +1005,7 @@ pick_cdr_file(){
 cdr_tail(){
   local f; f="$(pick_cdr_file)"
   if [[ -z "$f" ]]; then
-    warn "CDR CSV não encontrado. (Pode precisar habilitar cdr_csv no Asterisk.)"
+    warn "CDR CSV não encontrado."
     echo "Caminhos tentados:"
     echo " - $CDR_CSV1"
     echo " - $CDR_CSV2"
@@ -875,7 +1028,6 @@ cdr_by_ramal(){
 
   echo "${B}CDR:${D} $f"
   echo "(Últimos 80 que contenham o ramal no src/dst)"
-  # Master.csv é CSV padrão do Asterisk: não vamos fazer parser “perfeito”, mas funciona bem na prática.
   grep -F "\"$r\"" "$f" | tail -n 80 || true
 }
 
@@ -899,28 +1051,34 @@ data=json.load(open("${CFG}","r",encoding="utf-8"))
 online=set([x.strip() for x in """${online_list}""".splitlines() if x.strip()])
 busy=set([x.strip() for x in """${busy_list}""".splitlines() if x.strip()])
 
-def expired(vu):
-    vu=(vu or "").strip()
-    if not vu: return False
+def parse_iso(s):
+    if not s: return None
+    s=str(s).strip()
+    if not s: return None
     try:
-        return datetime.strptime(vu, "%Y-%m-%d %H:%M:%S") < datetime.now()
+        return datetime.fromisoformat(s.replace("Z",""))
     except Exception:
-        return True
+        return None
+
+def expired(exp):
+    dt=parse_iso(exp)
+    if not dt: return False
+    return dt < datetime.now()
 
 rows=[]
 p=data.get("portaria",{})
-rows.append(("PORTARIA","—",str(p.get("ramal","1000")).strip(),str(p.get("nome","PORTARIA")).strip(),p.get("active",True),p.get("valid_until","")))
+rows.append(("PORTARIA","—",str(p.get("ramal","1000")).strip(),str(p.get("nome","PORTARIA")).strip(),p.get("active",True),p.get("expires_at",None)))
 
 for ap in data.get("apartamentos",[]):
     apn=str(ap.get("numero","")).strip()
     apnome=str(ap.get("nome","")).strip()
     apLabel=apn + (f" ({apnome})" if apnome else "")
     for m in ap.get("moradores",[]):
-        rows.append(("MORADOR",apLabel,str(m.get("ramal","")).strip(),str(m.get("nome","")).strip(),m.get("active",True),m.get("valid_until","")))
+        rows.append(("MORADOR",apLabel,str(m.get("ramal","")).strip(),str(m.get("nome","")).strip(),m.get("active",True),m.get("expires_at",None)))
 
-def st_icon(r, active, vu):
+def st_icon(r, active, exp):
     if not active: return "⛔ INATIVO"
-    if expired(vu): return "⌛ VENCIDO"
+    if expired(exp): return "⌛ VENCIDO"
     if r in busy: return "🟡 BUSY"
     if r in online: return "🟢 ONLINE"
     return "🔴 OFFLINE"
@@ -928,11 +1086,11 @@ def st_icon(r, active, vu):
 print("")
 print("TABELA DE RAMAIS".center(76))
 print("-"*76)
-print(f"{'STATUS':<11} {'TIPO':<8} {'AP':<18} {'RAMAL':<8} {'NOME':<20} {'VALID'}")
+print(f"{'STATUS':<11} {'TIPO':<8} {'AP':<18} {'RAMAL':<8} {'NOME':<20} {'EXPIRES'}")
 print("-"*76)
-for typ, ap, r, nm, act, vu in rows:
-    status=st_icon(r, bool(act), vu)
-    v=vu if vu else "-"
+for typ, ap, r, nm, act, exp in rows:
+    status=st_icon(r, bool(act), exp)
+    v=str(exp) if exp else "-"
     print(f"{status:<11} {typ:<8} {ap:<18} {r:<8} {nm[:20]:<20} {v}")
 print("-"*76)
 PY
@@ -960,17 +1118,23 @@ data=json.load(open("${CFG}","r",encoding="utf-8"))
 online=set([x.strip() for x in """${online_list}""".splitlines() if x.strip()])
 busy=set([x.strip() for x in """${busy_list}""".splitlines() if x.strip()])
 
-def expired(vu):
-    vu=(vu or "").strip()
-    if not vu: return False
+def parse_iso(s):
+    if not s: return None
+    s=str(s).strip()
+    if not s: return None
     try:
-        return datetime.strptime(vu, "%Y-%m-%d %H:%M:%S") < datetime.now()
+        return datetime.fromisoformat(s.replace("Z",""))
     except Exception:
-        return True
+        return None
 
-def st(r, active, vu):
+def expired(exp):
+    dt=parse_iso(exp)
+    if not dt: return False
+    return dt < datetime.now()
+
+def st(r, active, exp):
     if not active: return "⛔ INATIVO"
-    if expired(vu): return "⌛ VENCIDO"
+    if expired(exp): return "⌛ VENCIDO"
     if r in busy: return "🟡 BUSY"
     if r in online: return "🟢 ONLINE"
     return "🔴 OFFLINE"
@@ -980,10 +1144,10 @@ p=data.get("portaria",{})
 pr=str(p.get("ramal","1000")).strip()
 pn=str(p.get("nome","PORTARIA")).strip()
 pact=bool(p.get("active",True))
-pvu=str(p.get("valid_until","")).strip()
+pexp=p.get("expires_at",None)
 blob=f"portaria {pr} {pn}".lower()
 if q in blob:
-    hits.append((st(pr,pact,pvu),"PORTARIA","—",pr,pn,pvu or "-"))
+    hits.append((st(pr,pact,pexp),"PORTARIA","—",pr,pn,str(pexp) if pexp else "-"))
 
 for ap in data.get("apartamentos",[]):
     apn=str(ap.get("numero","")).strip()
@@ -994,10 +1158,10 @@ for ap in data.get("apartamentos",[]):
         r=str(m.get("ramal","")).strip()
         nm=str(m.get("nome","")).strip()
         act=bool(m.get("active",True))
-        vu=str(m.get("valid_until","")).strip()
+        exp=m.get("expires_at",None)
         blob=f"{apBlob} {apLabel} {r} {nm}".lower()
         if q in blob:
-            hits.append((st(r,act,vu),"MORADOR",apLabel,r,nm,vu or "-"))
+            hits.append((st(r,act,exp),"MORADOR",apLabel,r,nm,str(exp) if exp else "-"))
 
 print("")
 print(f"RESULTADOS PARA: {q}".center(76))
@@ -1005,10 +1169,10 @@ print("-"*76)
 if not hits:
     print("Nenhum resultado.")
 else:
-    print(f"{'STATUS':<11} {'TIPO':<8} {'AP':<18} {'RAMAL':<8} {'NOME':<20} {'VALID'}")
+    print(f"{'STATUS':<11} {'TIPO':<8} {'AP':<18} {'RAMAL':<8} {'NOME':<20} {'EXPIRES'}")
     print("-"*76)
-    for s,t,ap,r,nm,vu in hits:
-        print(f"{s:<11} {t:<8} {ap:<18} {r:<8} {nm[:20]:<20} {vu}")
+    for s,t,ap,r,nm,exp in hits:
+        print(f"{s:<11} {t:<8} {ap:<18} {r:<8} {nm[:20]:<20} {exp}")
 print("-"*76)
 PY
 }
@@ -1023,10 +1187,8 @@ wizard_ap(){
   [[ "$n" =~ ^[0-9]+$ ]] || { bad "Número inválido."; return; }
   (( n >= 1 && n <= 20 )) || { bad "Use 1..20"; return; }
 
-  echo "Validade (opcional) para TODOS os moradores do wizard:"
-  echo " - ENTER = sem validade"
-  echo " - Formato: AAAA-MM-DD HH:MM:SS"
-  read -r -p "valid_until: " vu
+  echo "Expires_at (opcional) para TODOS os moradores do wizard:"
+  local exp; exp="$(read_expires_input)"
 
   echo "Senha padrão para todos? (ENTER = gerar diferente para cada)"
   local p1 p2
@@ -1037,16 +1199,24 @@ wizard_ap(){
     validate_pass "$p1" || { bad "Senha inválida."; return; }
   fi
 
-  py "$apnum" "$apname" "$n" "$p1" "$vu" <<PY
+  py "$apnum" "$apname" "$n" "$p1" "$exp" <<PY
 import json, sys, secrets, string, re
 apnum=sys.argv[1].strip()
 apname=sys.argv[2].strip()
 n=int(sys.argv[3].strip())
 shared=sys.argv[4] if len(sys.argv)>4 else ""
-vu=sys.argv[5].strip() if len(sys.argv)>5 else ""
+exp=sys.argv[5].strip() if len(sys.argv)>5 else ""
 
-if vu and not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", vu):
-    print("valid_until inválido. Use AAAA-MM-DD HH:MM:SS"); raise SystemExit(0)
+def norm(s):
+    s=(s or "").strip()
+    if not s: return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}$", s):
+        return s+"T23:59:59"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$", s):
+        return s.replace(" ","T")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$", s):
+        return s
+    print("expires_at inválido."); raise SystemExit(0)
 
 def gen():
     a=string.ascii_letters+string.digits+"._@:+#=-"
@@ -1059,7 +1229,7 @@ aps=data.setdefault("apartamentos",[])
 if any(str(a.get("numero","")).strip()==apnum for a in aps):
     print("AP já existe."); raise SystemExit(0)
 
-ap={"numero":apnum,"moradores":[],"nome":apname or ""}
+ap={"numero":apnum,"moradores":[],"nome":apname or "","active":True,"expires_at":None}
 
 port=str(data.get("portaria",{}).get("ramal","1000")).strip()
 used=set([port])
@@ -1073,7 +1243,7 @@ for i in range(1,n+1):
     if ramal in used:
         print("Conflito de ramal:", ramal); raise SystemExit(0)
     senha=shared if shared else gen()
-    ap["moradores"].append({"ramal":ramal,"nome":f"AP{apnum}-{i:02d}","senha":senha,"active":True,"valid_until":vu})
+    ap["moradores"].append({"ramal":ramal,"nome":f"AP{apnum}-{i:02d}","senha":senha,"active":True,"expires_at":norm(exp),"can_call":[]})
 
 aps.append(ap)
 json.dump(data, open(cfg,"w",encoding="utf-8"), indent=2, ensure_ascii=False)
@@ -1218,13 +1388,13 @@ menu(){
   while true; do
     dashboard
     echo "1) Status detalhado (endpoints/contacts/channels)"
-    echo "2) Listar APs e moradores (com ativo/validade)"
+    echo "2) Listar APs e moradores (com ativo/expires_at)"
     echo "3) Painel de ramais (🟢/🔴/🟡 + vencidos/inativos)"
     echo "4) Buscar (ramal/nome/ap)"
-    echo "5) Política: ver / alterar (quem fala com quem)"
+    echo "5) Política: ver / alterar (schema novo)"
     echo "6) Adicionar AP"
     echo "7) Wizard AP + N moradores (com senha)"
-    echo "8) Adicionar morador (ramal + senha + validade)"
+    echo "8) Adicionar morador (ramal + senha + expires_at)"
     echo "9) Remover morador (por ramal)"
     echo "10) Editar nome PORTARIA"
     echo "11) Editar nome AP"
@@ -1232,7 +1402,7 @@ menu(){
     echo "13) Definir senha manualmente (por ramal)"
     echo "14) Resetar senha (regenera no APPLY)"
     echo "15) Ativar/Inativar ramal (bloco)"
-    echo "16) Definir/Remover validade do ramal"
+    echo "16) Definir/Remover expires_at do ramal"
     echo "17) Listar ramais vencidos"
     echo "18) APPLY (gerar configs + reiniciar Asterisk)"
     echo "19) Restart Asterisk"
@@ -1249,6 +1419,7 @@ menu(){
     echo "30) Exportar condo.json sem senhas (safe export)"
     echo "31) Mostrar Integrações (AMI/ARI) + arquivo de senhas"
     echo "32) Instalar/Atualizar Core (install.sh completo)"
+    echo "33) Definir can_call do morador (AP:xxx / RAMAL:yyy)"
     echo "0) Sair"
     echo
     read -r -p "Escolha: " opt
@@ -1281,7 +1452,7 @@ menu(){
       13) set_password; pause ;;
       14) reset_senha; pause ;;
       15) set_active; pause ;;
-      16) set_valid_until; pause ;;
+      16) set_expires_at; pause ;;
       17) list_expired; pause ;;
       18) apply_configs; pause ;;
       19) restart_asterisk; pause ;;
@@ -1298,6 +1469,7 @@ menu(){
       30) export_safe; pause ;;
       31) show_integrations ;;
       32) install_now; pause ;;
+      33) set_can_call; pause ;;
       r) : ;;
       q|0) exit 0 ;;
       *) warn "Opção inválida"; pause ;;
