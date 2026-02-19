@@ -5,9 +5,11 @@ set -euo pipefail
 # INTERFONE • INSTALL (Debian 13)
 # Asterisk (source) + PJSIP + Dialplan gerado do condo.json
 #
-# FIX CRÍTICO (Linphone / REGISTER):
+# PRINCÍPIOS DE ESTABILIDADE (REGISTER):
 #  - endpoint_identifier_order=auth_username,username,ip
-#    (evita "No matching endpoint found")
+#  - endpoint == ramal (simples e robusto)
+#  - transport UDP + TCP em 5060
+#  - logs de auth em /var/log/asterisk/security.log
 # =========================
 
 APP_DIR="/opt/interfone"
@@ -57,8 +59,17 @@ parse_args(){
 
 detect_public_ip(){
   local ip=""
+  # 1) rota default (pega IP de saída)
   ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+  # 2) primeira interface global
   [[ -z "$ip" ]] && ip="$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 || true)"
+
+  # 3) tentativas via internet (quando VPS tem NAT/CGNAT ou rota estranha)
+  if [[ -z "$ip" ]] && command -v curl >/dev/null 2>&1; then
+    ip="$(curl -4fsS --max-time 2 https://api.ipify.org 2>/dev/null || true)"
+    [[ -z "$ip" ]] && ip="$(curl -4fsS --max-time 2 https://ifconfig.me 2>/dev/null || true)"
+  fi
+
   [[ -n "$ip" ]] || die "Não consegui detectar IP público/local da VPS."
   echo "$ip"
 }
@@ -146,7 +157,10 @@ install_deps(){
     libedit-dev libjansson-dev libxml2-dev uuid-dev libsqlite3-dev \
     libssl-dev libncurses-dev libnewt-dev \
     libcurl4-openssl-dev \
-    ufw
+    ufw \
+    iproute2 \
+    procps \
+    logrotate
 }
 
 build_asterisk_from_source(){
@@ -212,6 +226,8 @@ Group=asterisk
 RuntimeDirectory=asterisk
 RuntimeDirectoryMode=0755
 
+# -f = foreground
+# -U/-G = usuário/grupo
 ExecStart=${AST_BIN} -f -U asterisk -G asterisk -vvv
 ExecReload=${AST_BIN} -rx "core reload"
 ExecStop=${AST_BIN} -rx "core stop now"
@@ -228,9 +244,32 @@ EOF
   systemctl enable asterisk >/dev/null 2>&1 || true
 }
 
+write_logger_conf(){
+  local ETC="/etc/asterisk"
+  install -d "$ETC"
+
+  # Garante log de segurança (falhas auth/register etc.)
+  cat > "$ETC/logger.conf" <<'C'
+[general]
+dateformat=%F %T
+
+[logfiles]
+; log principal (verbose+notice+warning+error)
+messages => notice,warning,error,verbose
+
+; log de segurança: tentativas de REGISTER, auth failures, scanners
+security => security
+
+; console (quando roda no foreground)
+console => notice,warning,error,verbose
+C
+}
+
 write_static_confs(){
   local ETC="/etc/asterisk"
   install -d "$ETC"
+
+  write_logger_conf
 
   cat > "$ETC/rtp.conf" <<'C'
 [general]
@@ -306,30 +345,52 @@ generate_pjsip_and_dialplan(){
   local ETC="/etc/asterisk"
 
   python3 - "$CFG" "$SECRETS" "$VPS_IP" "$ETC" <<'PY'
-import json, secrets, string, sys, os
+import json, secrets, string, sys, os, re
 
 CFG, SECRETS, VPS_IP, ETC = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
-def gen_pass(n=16):
-    a = string.ascii_letters + string.digits + "._-@"
+def gen_pass(n=18):
+    a = string.ascii_letters + string.digits + "._-@:+#="
     return "".join(secrets.choice(a) for _ in range(n))
+
+def clean_ext(x):
+    x = str(x).strip()
+    if not x:
+        return ""
+    # aceita só dígitos para ramal (interfone)
+    if not re.fullmatch(r"\d{2,10}", x):
+        raise SystemExit(f"Ramal inválido: {x} (use só dígitos, 2..10 chars)")
+    return x
 
 data = json.load(open(CFG, "r", encoding="utf-8"))
 
 data.setdefault("portaria", {"ramal": "1000", "nome": "PORTARIA", "senha": ""})
+data["portaria"]["ramal"] = clean_ext(data["portaria"].get("ramal", "1000") or "1000")
 if not str(data["portaria"].get("senha","")).strip():
     data["portaria"]["senha"] = gen_pass()
 
+# garante senhas para moradores
+ramais_global=set([data["portaria"]["ramal"]])
+
 for ap in data.get("apartamentos", []):
+    apnum=str(ap.get("numero","")).strip()
     for m in ap.get("moradores", []):
+        m["ramal"]=clean_ext(m.get("ramal",""))
+        if not m["ramal"]:
+            raise SystemExit(f"Morador sem ramal no AP {apnum}")
+        if m["ramal"] in ramais_global:
+            raise SystemExit(f"Ramal duplicado detectado: {m['ramal']}")
+        ramais_global.add(m["ramal"])
         if not str(m.get("senha","")).strip():
             m["senha"] = gen_pass()
 
 # =========================
-# PJSIP (FIX Linphone)
-# - AOR = RAMAL (10001)
-# - ENDPOINT = ep-<ramal> (ep-10001)
-# - endpoint_identifier_order = auth_username,username,ip
+# PJSIP (robusto)
+# - endpoint == ramal
+# - aor == ramal
+# - auth == ramal
+# - endpoint_identifier_order=auth_username,username,ip
+# - transport UDP + TCP em 5060
 # =========================
 p=[]
 p.append("; INTERFONE - GERADO AUTOMATICAMENTE\n\n")
@@ -339,22 +400,37 @@ p.append("type=global\n")
 p.append("user_agent=InterfonePBX/1.0\n")
 p.append("endpoint_identifier_order=auth_username,username,ip\n\n")
 
+# UDP
 p.append("[transport-udp]\n")
 p.append("type=transport\nprotocol=udp\nbind=0.0.0.0:5060\n")
 p.append(f"external_signaling_address={VPS_IP}\nexternal_media_address={VPS_IP}\n")
 p.append("local_net=10.0.0.0/8\nlocal_net=172.16.0.0/12\nlocal_net=192.168.0.0/16\n\n")
 
+# TCP (mesma porta 5060)
+p.append("[transport-tcp]\n")
+p.append("type=transport\nprotocol=tcp\nbind=0.0.0.0:5060\n")
+p.append(f"external_signaling_address={VPS_IP}\nexternal_media_address={VPS_IP}\n")
+p.append("local_net=10.0.0.0/8\nlocal_net=172.16.0.0/12\nlocal_net=192.168.0.0/16\n\n")
+
+# template
 p.append("[endpoint-common](!)\n")
 p.append("type=endpoint\n")
+# IMPORTANTE: se teu cliente usar UDP, funciona com transport-udp
+# Se usar TCP, você pode mudar aqui pra transport-tcp OU criar endpoint específico.
 p.append("transport=transport-udp\n")
 p.append("disallow=all\nallow=ulaw,alaw\n")
-p.append("direct_media=no\nrtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\n")
+p.append("direct_media=no\n")
+p.append("rtp_symmetric=yes\nforce_rport=yes\nrewrite_contact=yes\n")
 p.append("timers=yes\nlanguage=pt_BR\n")
-p.append("identify_by=auth_username\n")
-p.append("allow_unauthenticated_options=no\n\n")
+p.append("allow_unauthenticated_options=no\n")
+p.append("mwi_subscribe_replaces_unsolicited=yes\n")
+p.append("send_rpid=yes\n")
+p.append("trust_id_outbound=yes\n")
+p.append("trust_id_inbound=yes\n\n")
 
 p.append("[aor-common](!)\n")
-p.append("type=aor\nmax_contacts=5\nremove_existing=yes\nqualify_frequency=30\n\n")
+p.append("type=aor\n")
+p.append("max_contacts=5\nremove_existing=yes\nqualify_frequency=30\n\n")
 
 p.append("[auth-common](!)\n")
 p.append("type=auth\nauth_type=userpass\n\n")
@@ -363,9 +439,9 @@ def add_user(ramal, nome, senha, context):
     ramal = str(ramal).strip()
     if not ramal:
         return
+    endpoint = ramal
     aor = ramal
-    endpoint = f"ep-{ramal}"
-    auth = f"auth-{ramal}"
+    auth = ramal
 
     p.append(f"[{aor}](aor-common)\n\n")
     p.append(f"[{auth}](auth-common)\nusername={ramal}\npassword={senha}\n\n")
@@ -385,8 +461,8 @@ open(os.path.join(ETC, "pjsip.conf"), "w", encoding="utf-8").write("".join(p))
 
 # =========================
 # DIALPLAN
-# - Discar AP (100/101) toca todos moradores do AP
-# - Discar ramal direto (10001/10101...)
+# - Discar AP (101/804) toca todos moradores do AP
+# - Discar ramal direto (10101/80401...)
 # - Morador disca 1000 para portaria
 # =========================
 e=[]
@@ -408,7 +484,7 @@ e.append(" same => n,Hangup()\n\n")
 e.append("[extens]\n")
 port_r = str(data.get("portaria", {}).get("ramal", "1000")).strip() or "1000"
 e.append(f"exten => {port_r},1,NoOp(CHAMANDO PORTARIA)\n")
-e.append(f" same => n,Dial(PJSIP/ep-{port_r},30)\n")
+e.append(f" same => n,Dial(PJSIP/{port_r},30)\n")
 e.append(" same => n,Hangup()\n\n")
 
 ramais=set()
@@ -420,13 +496,13 @@ for ap in data.get("apartamentos", []):
 
 for r in sorted(ramais):
     e.append(f"exten => {r},1,NoOp(CHAMANDO RAMAL {r})\n")
-    e.append(f" same => n,Dial(PJSIP/ep-{r},30)\n")
+    e.append(f" same => n,Dial(PJSIP/{r},30)\n")
     e.append(" same => n,Hangup()\n\n")
 
 e.append("[apartments]\n")
 for ap in data.get("apartamentos", []):
     apnum=str(ap.get("numero","")).strip()
-    targets=[f"PJSIP/ep-{str(m.get('ramal','')).strip()}" for m in ap.get("moradores", []) if str(m.get("ramal","")).strip()]
+    targets=[f"PJSIP/{str(m.get('ramal','')).strip()}" for m in ap.get("moradores", []) if str(m.get("ramal","")).strip()]
     dial="&".join(targets)
     e.append(f"exten => {apnum},1,NoOp(AP {apnum} - RingGroup)\n")
     if dial:
@@ -451,9 +527,10 @@ enable_firewall(){
   [[ "$NO_UFW" -eq 1 ]] && { warn "UFW ignorado (--no-ufw)."; return 0; }
   command -v ufw >/dev/null 2>&1 || { warn "ufw não instalado; pulando firewall."; return 0; }
 
-  log "Configurando UFW (SSH + SIP 5060/UDP + RTP 10000-20000/UDP)..."
+  log "Configurando UFW (SSH + SIP 5060 UDP/TCP + RTP 10000-20000/UDP)..."
   ufw allow OpenSSH >/dev/null 2>&1 || true
   ufw allow 5060/udp >/dev/null 2>&1 || true
+  ufw allow 5060/tcp >/dev/null 2>&1 || true
   ufw allow 10000:20000/udp >/dev/null 2>&1 || true
   ufw --force enable >/dev/null 2>&1 || true
 }
@@ -463,7 +540,10 @@ dump_failure(){
   echo "==================== DIAGNÓSTICO (FALHA START) ===================="
   systemctl status asterisk --no-pager -l || true
   echo "-------------------------------------------------------------------"
-  journalctl -u asterisk -n 180 --no-pager || true
+  journalctl -u asterisk -n 220 --no-pager || true
+  echo "-------------------------------------------------------------------"
+  echo "Últimas linhas /var/log/asterisk/security.log:"
+  tail -n 120 /var/log/asterisk/security.log 2>/dev/null || true
   echo "==================================================================="
   echo
 }
@@ -478,14 +558,14 @@ restart_and_wait(){
   systemctl restart asterisk || { dump_failure; die "systemctl restart asterisk falhou"; }
 
   local i
-  for i in {1..30}; do
+  for i in {1..35}; do
     systemctl is-active --quiet asterisk && break
     sleep 0.4
   done
 
   systemctl is-active --quiet asterisk || { dump_failure; die "Asterisk não ficou ACTIVE."; }
 
-  for i in {1..30}; do
+  for i in {1..35}; do
     "${AST_BIN}" -rx "core show version" >/dev/null 2>&1 && { log "Asterisk OK e respondendo."; return 0; }
     sudo -u asterisk "${AST_BIN}" -rx "core show version" >/dev/null 2>&1 && { log "Asterisk OK e respondendo (como usuário asterisk)."; return 0; }
     sleep 0.4
@@ -501,7 +581,7 @@ main(){
 
   local VPS_IP
   VPS_IP="$(detect_public_ip)"
-  log "IP da VPS: $VPS_IP"
+  log "IP detectado: $VPS_IP"
 
   ensure_seed_config
   ensure_integrations
@@ -535,6 +615,9 @@ main(){
   echo "Service:  systemctl status asterisk"
   echo "Senhas:   $SECRETS"
   echo "AMI/ARI:  $INTEG_TXT"
+  echo "LOGS:"
+  echo "  /var/log/asterisk/messages"
+  echo "  /var/log/asterisk/security.log   (LOGIN/REGISTER failures)"
   echo "Testes:"
   echo "  asterisk -rx \"pjsip show endpoints\""
   echo "  asterisk -rx \"pjsip show contacts\""
