@@ -9,6 +9,7 @@ set -euo pipefail
 # - Wizard: criar AP + N moradores (com senha)
 # - Ao adicionar morador: ramal + senha na hora (manual ou auto)
 # - Apply/restart/logs/health-check
+# - Monitor LIVE de tentativas de LOGIN/REGISTER
 # ==========================================
 
 APP_DIR="/opt/interfone"
@@ -16,7 +17,9 @@ CFG="$APP_DIR/condo.json"
 SECRETS="/root/interfone-secrets.json"
 INTEG_TXT="/root/interfone-integrations.txt"
 INSTALL_LOG="/root/interfone-install.log"
+
 ASTERISK_LOG="/var/log/asterisk/messages"
+ASTERISK_SEC="/var/log/asterisk/security.log"
 
 USE_COLOR="${USE_COLOR:-1}"
 REFRESH_SLEEP="${REFRESH_SLEEP:-2}"
@@ -122,11 +125,18 @@ ast_calls_summary(){
   echo "$calls $ch"
 }
 
+# tenta extrair ramal do "pjsip show contacts"
+# formatos comuns:
+#   Contact: 10101/sip:10101@x.x.x.x:port;...
+#   Contact: 10101-... (depende da versão)
 ast_online_ramals(){
   ast_rx "pjsip show contacts" | awk '
     /^ *Contact:/{
       x=$2
-      sub(/-aor\/.*/,"",x)
+      # x pode ser "10101/sip:..." ou "10101-..."
+      split(x,a,"/")
+      x=a[1]
+      sub(/-.*$/,"",x)
       gsub(/[^0-9]/,"",x)
       if (x!="") print x
     }' | sort -u
@@ -156,7 +166,6 @@ validate_pass(){
 }
 
 gen_password(){
-  # 20 chars safe
   python3 - <<'PY'
 import secrets,string
 a=string.ascii_letters+string.digits+"._@:+#=-"
@@ -252,11 +261,10 @@ PY
   chmod 600 "$CFG" || true
 }
 
-# calcula próximo ramal automático no padrão APxx01, APxx02...
 suggest_next_ramal(){
   local apnum="$1"
   py "$apnum" <<PY
-import json, sys, re
+import json, sys
 apnum=sys.argv[1].strip()
 data=json.load(open("${CFG}","r",encoding="utf-8"))
 aps=data.get("apartamentos",[])
@@ -270,8 +278,6 @@ used=set()
 for m in ap.get("moradores",[]):
     r=str(m.get("ramal","")).strip()
     if r: used.add(r)
-
-# tenta APNUM + 01..99
 for i in range(1,100):
     cand=f"{apnum}{i:02d}"
     if cand not in used:
@@ -280,7 +286,6 @@ print(f"{apnum}99")
 PY
 }
 
-# ✅ MELHORIA: ao adicionar morador já cria RAMAL + SENHA (manual ou auto)
 add_morador(){
   ensure_cfg_exists
   echo "Selecione o AP:"
@@ -337,6 +342,10 @@ if ap is None:
     print("AP não existe."); raise SystemExit(0)
 
 # ramal global único
+port=str(data.get("portaria",{}).get("ramal","1000")).strip()
+if ramal==port:
+    print("Ramal conflita com PORTARIA."); raise SystemExit(0)
+
 for a in aps:
     for m in a.get("moradores",[]):
         if str(m.get("ramal","")).strip()==ramal:
@@ -577,26 +586,34 @@ service_status(){
 }
 
 tail_logs(){
-  if [[ -f "$ASTERISK_LOG" ]]; then
-    echo "Log: $ASTERISK_LOG"
-    hr
-    tail -n 200 "$ASTERISK_LOG" || true
-  else
-    warn "Arquivo de log não encontrado: $ASTERISK_LOG"
-    echo "Dica: systemctl status asterisk -l"
-  fi
+  echo "${B}LOG PRINCIPAL:${D} $ASTERISK_LOG"
+  [[ -f "$ASTERISK_LOG" ]] && tail -n 200 "$ASTERISK_LOG" || warn "Não achei $ASTERISK_LOG"
+  echo
+  echo "${B}LOG SEGURANÇA (LOGIN/REGISTER):${D} $ASTERISK_SEC"
+  [[ -f "$ASTERISK_SEC" ]] && tail -n 200 "$ASTERISK_SEC" || warn "Não achei $ASTERISK_SEC"
 }
 
-install_now(){
-  [[ -x ./install.sh ]] || { bad "install.sh não encontrado no diretório atual."; return; }
-  ok "Instalando/atualizando Asterisk + Core..."
-  bash ./install.sh |& tee "$INSTALL_LOG"
-  echo "Log: $INSTALL_LOG"
+monitor_logins_live(){
+  echo
+  echo "${B}${C}MONITOR LIVE - TENTATIVAS DE LOGIN/REGISTER${D}"
+  echo "Arquivos:"
+  echo "  - $ASTERISK_SEC  (auth failures / scanners / REGISTER issues)"
+  echo "  - $ASTERISK_LOG  (geral)"
+  echo
+  echo "${Y}Dica:${D} tente logar no Linphone/Zoiper agora e observe as linhas."
+  echo "${Y}Ctrl+C${D} para sair."
+  echo
+  if [[ -f "$ASTERISK_SEC" ]]; then
+    tail -n 0 -F "$ASTERISK_SEC" | sed -u 's/^/[SEC] /'
+  else
+    warn "security.log não existe ainda. Rode APPLY/restart para o logger gerar."
+    pause
+  fi
 }
 
 pjsip_logger_toggle(){
   asterisk_active || { bad "Asterisk não está ativo."; return; }
-  echo "1) ON  (pjsip set logger on)"
+  echo "1) ON  (pjsip set logger on)  [mostra pacotes SIP no console/CLI]"
   echo "2) OFF (pjsip set logger off)"
   read -r -p "Escolha: " o
   case "$o" in
@@ -612,7 +629,7 @@ firewall_helper(){
   ufw status || true
   echo
   echo "Ações:"
-  echo "1) Liberar SIP (5060/udp) + RTP (10000-20000/udp) + SSH e ativar"
+  echo "1) Liberar SIP (5060/udp + 5060/tcp) + RTP (10000-20000/udp) + SSH e ativar"
   echo "2) Desativar UFW"
   echo "3) Mostrar regras"
   read -r -p "Escolha: " o
@@ -620,6 +637,7 @@ firewall_helper(){
     1)
       ufw allow OpenSSH || true
       ufw allow 5060/udp || true
+      ufw allow 5060/tcp || true
       ufw allow 10000:20000/udp || true
       ufw --force enable || true
       ok "UFW configurado."
@@ -645,7 +663,6 @@ explain_integrations(){
   warn "Manter localhost-only é o mais seguro. Se precisar acesso externo depois: túnel SSH."
 }
 
-# ---------- premium: tabela de ramais + busca ----------
 panel_ramais(){
   ensure_cfg_exists
 
@@ -796,8 +813,8 @@ if any(str(a.get("numero","")).strip()==apnum for a in aps):
 ap={"numero":apnum,"moradores":[]}
 if apname: ap["nome"]=apname
 
-# ramais apnum01..apnumNN
-used=set()
+port=str(data.get("portaria",{}).get("ramal","1000")).strip()
+used=set([port])
 for a in aps:
     for m in a.get("moradores",[]):
         r=str(m.get("ramal","")).strip()
@@ -826,33 +843,31 @@ health_check(){
   echo "HEALTH CHECK (SIP CORE)"
   hr
 
-  # Asterisk
   if asterisk_installed; then ok "Asterisk instalado: $(command -v asterisk)"; else bad "Asterisk NÃO instalado"; fi
   if asterisk_service_exists; then ok "Service existe: asterisk.service"; else warn "Service não encontrado"; fi
   if asterisk_active; then ok "Service ATIVO"; else warn "Service OFF"; fi
 
-  # Portas escutando (local)
   if have ss; then
-    if ss -lunp 2>/dev/null | grep -qE '(:5060)\s'; then ok "UDP 5060 escutando (SIP)"; else warn "UDP 5060 NÃO parece escutar"; fi
+    ss -lunp 2>/dev/null | grep -qE '(:5060)\s' && ok "UDP 5060 escutando (SIP)" || warn "UDP 5060 NÃO parece escutar"
+    ss -lntp 2>/dev/null | grep -qE '(:5060)\s' && ok "TCP 5060 escutando (SIP)" || warn "TCP 5060 NÃO parece escutar"
   else
     warn "ss não encontrado (iproute2)."
   fi
 
-  # UFW
   if have ufw; then
     ufw_active && ok "UFW ativo" || warn "UFW off"
     ufw_has_rule "5060/udp" && ok "Regra 5060/udp OK" || warn "Regra 5060/udp ausente"
+    ufw_has_rule "5060/tcp" && ok "Regra 5060/tcp OK" || warn "Regra 5060/tcp ausente"
     ufw_has_rule "10000:20000/udp" && ok "Regra RTP 10000:20000 OK" || warn "Regra RTP ausente"
   else
     warn "ufw não instalado."
   fi
 
-  # Configs
   [[ -f "$CFG" ]] && ok "CFG: $CFG" || bad "CFG ausente: $CFG"
   [[ -f "/etc/asterisk/pjsip.conf" ]] && ok "pjsip.conf existe" || warn "pjsip.conf ausente (rode APPLY)"
   [[ -f "/etc/asterisk/extensions.conf" ]] && ok "extensions.conf existe" || warn "extensions.conf ausente (rode APPLY)"
+  [[ -f "$ASTERISK_SEC" ]] && ok "security.log existe (login/register)" || warn "security.log não existe ainda"
 
-  # Counts
   if asterisk_active; then
     local ep on calls chans
     ep="$(ast_endpoints_count)"
@@ -869,7 +884,7 @@ health_check(){
 dashboard(){
   ensure_cfg_exists
 
-  local ip srv_inst srv_act srv_en ufw on5060 onrtp
+  local ip srv_inst srv_act srv_en ufw on5060u on5060t onrtp
   ip="$(get_public_ip)"
 
   srv_inst="$(asterisk_installed && echo "INSTALADO" || echo "NÃO")"
@@ -877,7 +892,8 @@ dashboard(){
   srv_en="$(asterisk_enabled && echo "ENABLED" || echo "DISABLED")"
 
   ufw="$(ufw_active && echo "ON" || echo "OFF")"
-  on5060="$(ufw_has_rule "5060/udp" && echo "OK" || echo "X")"
+  on5060u="$(ufw_has_rule "5060/udp" && echo "OK" || echo "X")"
+  on5060t="$(ufw_has_rule "5060/tcp" && echo "OK" || echo "X")"
   onrtp="$(ufw_has_rule "10000:20000/udp" && echo "OK" || echo "X")"
 
   local endpoints="—" online="—" calls="—" chans="—"
@@ -893,62 +909,13 @@ dashboard(){
   clear
   title_box
   printf "${B}${W}IP:${D} %s\n" "$ip"
-  echo "[ASTERISK: $srv_inst]  [SERVIÇO: $srv_act]  [BOOT: $srv_en]  [UFW: $ufw]  [PORTAS: 5060:$on5060 RTP:$onrtp]  [SECRETS: $secrets_state]"
+  echo "[ASTERISK: $srv_inst]  [SERVIÇO: $srv_act]  [BOOT: $srv_en]  [UFW: $ufw]  [PORTAS: 5060/udp:$on5060u 5060/tcp:$on5060t RTP:$onrtp]  [SECRETS: $secrets_state]"
   hr
   printf "${B}${C}Resumo:${D} Endpoints=%s  Online=%s  Calls=%s  Channels=%s\n" \
     "${B}${endpoints}${D}" "${B}${online}${D}" "${B}${calls}${D}" "${B}${chans}${D}"
 
-  echo
-  printf "${B}${C}Apartamentos (overview):${D}\n"
-
-  if ! asterisk_active; then
-    warn "Asterisk OFF — overview por AP exibirá apenas cadastro."
-    py <<PY
-import json
-data=json.load(open("${CFG}","r",encoding="utf-8"))
-aps=data.get("apartamentos",[])
-if not aps:
-    print("  (Nenhum AP cadastrado)")
-else:
-    for ap in aps:
-        apn=str(ap.get("numero","?")).strip()
-        apnome=str(ap.get("nome","")).strip()
-        mor=ap.get("moradores",[])
-        label=f"AP {apn}"
-        if apnome: label += f" - {apnome}"
-        print(f"  - {label}: {len(mor)} morador(es)")
-PY
-  else
-    local online_list busy_list
-    online_list="$(ast_online_ramals || true)"
-    busy_list="$(ast_busy_ramals || true)"
-
-    python3 - <<PY
-import json
-data=json.load(open("${CFG}","r",encoding="utf-8"))
-online=set([x.strip() for x in """${online_list}""".splitlines() if x.strip()])
-busy=set([x.strip() for x in """${busy_list}""".splitlines() if x.strip()])
-
-aps=data.get("apartamentos",[])
-if not aps:
-    print("  (Nenhum AP cadastrado)")
-else:
-    for ap in aps:
-        apn=str(ap.get("numero","?")).strip()
-        apnome=str(ap.get("nome","")).strip()
-        mor=ap.get("moradores",[])
-        total=len(mor)
-        on=sum(1 for m in mor if str(m.get("ramal","")).strip() in online)
-        bz=sum(1 for m in mor if str(m.get("ramal","")).strip() in busy)
-        label=f"AP {apn}"
-        if apnome: label += f" - {apnome}"
-        st = "BUSY" if bz>0 else ("ONLINE" if on>0 else "OFFLINE")
-        print(f"  - {label}: {on}/{total} online | {bz} busy | {st}")
-PY
-  fi
-
   hr
-  echo "${B}${W}Atalhos rápidos:${D} [R]efresh  [M]onitor  [P]ainel  [B]uscar  [H]ealth  [Q]uit"
+  echo "${B}${W}Atalhos rápidos:${D} [R]efresh  [P]ainel  [B]uscar  [H]ealth  [L]oginsLive  [Q]uit"
   echo
 }
 
@@ -967,10 +934,17 @@ monitor_mode(){
   done
 }
 
+install_now(){
+  [[ -x ./install.sh ]] || { bad "install.sh não encontrado no diretório atual."; return; }
+  ok "Instalando/atualizando Asterisk + Core..."
+  bash ./install.sh |& tee "$INSTALL_LOG"
+  echo "Log: $INSTALL_LOG"
+}
+
 menu(){
   while true; do
     dashboard
-    echo "1) Ver status detalhado (endpoints/contacts/channels)"
+    echo "1) Status detalhado (endpoints/contacts/channels)"
     echo "2) Listar APs e moradores"
     echo "3) Painel de ramais (tabela 🟢/🔴/🟡)"
     echo "4) Buscar (ramal/nome/ap)"
@@ -987,18 +961,20 @@ menu(){
     echo "15) Senhas/Integrações (AMI/ARI + testes)"
     echo "16) Restart Asterisk"
     echo "17) Status do serviço (systemctl)"
-    echo "18) Logs (tail asterisk/messages)"
+    echo "18) Logs (messages + security)"
     echo "19) PJSIP Logger (on/off)"
     echo "20) Firewall (UFW)"
     echo "21) Health Check"
     echo "22) MONITOR MODE (live)"
-    echo "23) Instalar/Atualizar Asterisk (source) + Core"
+    echo "23) Monitor LIVE tentativas LOGIN/REGISTER (security.log)"
+    echo "24) Exportar condo.json sem senhas (safe export)"
+    echo "25) Instalar/Atualizar Asterisk (source) + Core"
     echo "0) Sair"
     echo
     read -r -p "Escolha: " opt
 
     case "${opt,,}" in
-      1|s)
+      1)
         if ! asterisk_active; then bad "Asterisk não está ativo."; pause; continue; fi
         echo "---- ENDPOINTS ----"; ast_rx "pjsip show endpoints"; echo
         echo "---- CONTACTS ----";  ast_rx "pjsip show contacts"; echo
@@ -1021,7 +997,7 @@ menu(){
       15)
         echo "${B}Senhas SIP:${D} $SECRETS"
         if [[ -f "$SECRETS" ]]; then
-          sed -n '1,240p' "$SECRETS" | head -n 220
+          sed -n '1,260p' "$SECRETS" | head -n 240
         else
           warn "Ainda não gerado. Rode APPLY para gerar e salvar senhas."
         fi
@@ -1038,8 +1014,10 @@ menu(){
       19) pjsip_logger_toggle; pause ;;
       20) firewall_helper; pause ;;
       21|h) health_check; pause ;;
-      22|m) monitor_mode ;;
-      23) install_now; pause ;;
+      22) monitor_mode ;;
+      23|l) monitor_logins_live ;;
+      24) export_safe; pause ;;
+      25) install_now; pause ;;
       r) : ;;
       q|0) exit 0 ;;
       *) warn "Opção inválida"; pause ;;
