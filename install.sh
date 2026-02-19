@@ -381,7 +381,6 @@ EOF
 
   # include gerados
   grep -q "interfone.generated" "$ETC/pjsip.conf" 2>/dev/null || {
-    # garante que pjsip.conf existe
     [[ -f "$ETC/pjsip.conf" ]] || echo "; base pjsip" > "$ETC/pjsip.conf"
     cat >> "$ETC/pjsip.conf" <<EOF
 
@@ -421,7 +420,6 @@ def parse_dt(s):
     if s is None: return None
     s = str(s).strip()
     if not s or s.lower() in ("null","none"): return None
-    # aceita "2026-03-01" ou "2026-03-01T23:59:59"
     if "T" in s:
         return datetime.datetime.fromisoformat(s)
     return datetime.datetime.fromisoformat(s + "T23:59:59")
@@ -447,12 +445,9 @@ data["portaria"]["ramal"] = clean_ext(data["portaria"].get("ramal","1000") or "1
 if not str(data["portaria"].get("senha","")).strip():
     data["portaria"]["senha"] = gen_pass()
 
-# Index de ramais e metadados
 ramais = {}
-# "virtual targets" para policy: PORTARIA, AP:101, RAMAL:10101
 PORT_R = data["portaria"]["ramal"]
 
-# apartamentos
 for ap in data.get("apartamentos", []):
     ap.setdefault("active", True)
     ap.setdefault("expires_at", None)
@@ -465,17 +460,14 @@ for ap in data.get("apartamentos", []):
         m.setdefault("nome", f"AP{apnum}")
         m.setdefault("active", True)
         m.setdefault("expires_at", None)
-        m.setdefault("can_call", [])  # lista de destinos adicionais (strings)
+        m.setdefault("can_call", [])
         if not str(m.get("senha","")).strip():
             m["senha"] = gen_pass()
         if m["ramal"] in ramais or m["ramal"] == PORT_R:
             raise SystemExit(f"Ramal duplicado: {m['ramal']}")
         ramais[m["ramal"]] = {"ap": apnum, "nome": m["nome"], "obj": m}
 
-# PJSIP: cria endpoint para todos (mesmo inativos/expirados) -> o dialplan bloqueia tudo
-# Motivo: manter previsível e poder "reativar" só no JSON sem quebrar reload.
-# Se você quiser impedir até o REGISTER de inativo, depois a gente evolui para "gerar sem endpoint".
-
+# ---------------- PJSIP ----------------
 p=[]
 p.append("; INTERFONE - GERADO AUTOMATICAMENTE\n\n")
 
@@ -529,112 +521,58 @@ def add_user(ramal, nome, senha, context):
     p.append(f"auth={ramal}\n")
     p.append(f"aors={ramal}\n")
     p.append(f"callerid=\"{nome}\" <{ramal}>\n")
-    # anti-scanner: não responder OPTIONS sem auth
     p.append("identify_by=auth_username,username\n\n")
 
 # Portaria
 add_user(PORT_R, data["portaria"].get("nome","PORTARIA"), data["portaria"]["senha"], "from-interfone")
+
 # Moradores
 for r, meta in sorted(ramais.items(), key=lambda x: x[0]):
     add_user(r, meta["nome"], meta["obj"]["senha"], "from-interfone")
 
 open(os.path.join(GEN_DIR, "pjsip.interfone.generated.conf"), "w", encoding="utf-8").write("".join(p))
 
-# EXTENSIONS (policy/validade/ativo + ringgroup)
+# ---------------- DIALPLAN ----------------
 e=[]
 e.append("; INTERFONE - GERADO AUTOMATICAMENTE\n\n")
 
-# Funções utilitárias no dialplan:
-# - InterfoneIsAllowed(CALLER, DEST): valida policy/active/expiry
-# - InterfoneLog(): adiciona userfield e tags em CDR
-# Implementamos com ASTDB-like? Aqui vamos direto por dialplan gerado (rápido e determinístico).
-
-# Context único
 e.append("[from-interfone]\n")
 e.append("exten => _X.,1,NoOp(INTERFONE IN ${CALLERID(num)} -> ${EXTEN})\n")
-# Tag pra histórico (CDR)
 e.append(" same => n,Set(CDR(userfield)=INTERFONE caller=${CALLERID(num)} dest=${EXTEN})\n")
 e.append(" same => n,Goto(interfone-route,${EXTEN},1)\n\n")
 
-# Roteamento
 e.append("[interfone-route]\n")
 e.append("exten => _X.,1,NoOp(ROUTE ${CALLERID(num)} -> ${EXTEN})\n")
 
-# ========== BLOQUEIOS / POLÍTICA ==========
-# 1) Checa se caller existe (portaria ou morador)
-# 2) Checa ativo/expiração do caller
-# 3) Se destino é apartamento: toca ringgroup
-# 4) Se destino é ramal: valida policy (anti-trote)
-# 5) Portaria pode ligar para qualquer ramal (se ativa)
-# 6) Morador por default só liga portaria, a não ser que policy permita
-
-# Mapas gerados em forma de "GotoIf" para ser ultra rápido.
-
-# Lista de ramais e status (caller)
-def status_line(ext, active):
-    return f' same => n,GotoIf($["{ext}"="{ "${{CALLERID(num)}}" }"]?caller_{ext}:nextcaller)\n'  # placeholder
-
-# A gente vai montar um bloco determinístico:
-callers = [PORT_R] + sorted(ramais.keys())
-caller_status = {}
-caller_name = {}
-caller_can_call = {}
-
-# Portaria
-caller_status[PORT_R] = is_active(data["portaria"])
-caller_name[PORT_R] = data["portaria"].get("nome","PORTARIA")
-caller_can_call[PORT_R] = ["ANY"]
-
-# Moradores
-for r, meta in ramais.items():
-    apnum = meta["ap"]
-    ap_obj = next((a for a in data.get("apartamentos",[]) if str(a.get("numero","")).strip()==apnum), None)
-    ok = is_active(meta["obj"]) and is_active(ap_obj or {})
-    caller_status[r] = ok
-    caller_name[r] = meta["nome"]
-
-    # policy: default + extras
-    allowed = []
-    # default_resident_can_call: ["PORTARIA"] etc
-    for d in policy.get("default_resident_can_call", ["PORTARIA"]):
-        allowed.append(str(d))
-    # allow_resident_to_resident
-    if policy.get("allow_resident_to_resident", False):
-        allowed.append("RESIDENTS")
-    # can_call per user (ex: ["AP:101", "RAMAL:20202"])
-    for d in meta["obj"].get("can_call", []) or []:
-        allowed.append(str(d))
-    caller_can_call[r] = allowed
-
-# Destinos existentes:
-dest_ramais = set(callers)  # inclui portaria + moradores
-dest_aps = set(str(a.get("numero","")).strip() for a in data.get("apartamentos",[]) if str(a.get("numero","")).strip())
-
-# Função: valida caller (seta VARs)
 e.append(" same => n,Set(__IF_CALLER_OK=0)\n")
 e.append(" same => n,Set(__IF_CALLER_NAME=UNKNOWN)\n")
 e.append(" same => n,Set(__IF_CALLER_TYPE=UNKNOWN)\n")
 
-# if caller == portaria
+# portaria?
 e.append(f' same => n,GotoIf($["{PORT_R}"="${{CALLERID(num)}}"]?is_portaria:chk_res)\n')
 e.append(" same => n(is_portaria),Set(__IF_CALLER_TYPE=PORTARIA)\n")
-e.append(f" same => n,Set(__IF_CALLER_NAME={caller_name[PORT_R]})\n")
-e.append(f" same => n,Set(__IF_CALLER_OK={'1' if caller_status[PORT_R] else '0'})\n")
+e.append(f" same => n,Set(__IF_CALLER_NAME={data['portaria'].get('nome','PORTARIA')})\n")
+e.append(f" same => n,Set(__IF_CALLER_OK={'1' if is_active(data['portaria']) else '0'})\n")
 e.append(" same => n,Goto(chk_ok)\n")
 
-# check residents
+# residents
 e.append(" same => n(chk_res),NoOp(CALLER resident check)\n")
 for r in sorted(ramais.keys()):
+    meta = ramais[r]
+    apnum = meta["ap"]
+    ap_obj = next((a for a in data.get("apartamentos",[]) if str(a.get("numero","")).strip()==apnum), {})
+    ok = is_active(meta["obj"]) and is_active(ap_obj)
+
     e.append(f' same => n,GotoIf($["{r}"="${{CALLERID(num)}}"]?caller_{r}:nextcaller_{r})\n')
     e.append(f" same => n(caller_{r}),Set(__IF_CALLER_TYPE=RESIDENT)\n")
-    e.append(f" same => n,Set(__IF_CALLER_NAME={caller_name[r]})\n")
-    e.append(f" same => n,Set(__IF_CALLER_OK={'1' if caller_status[r] else '0'})\n")
+    e.append(f" same => n,Set(__IF_CALLER_NAME={meta['nome']})\n")
+    e.append(f" same => n,Set(__IF_CALLER_OK={'1' if ok else '0'})\n")
     e.append(" same => n,Goto(chk_ok)\n")
     e.append(f" same => n(nextcaller_{r}),NoOp(.)\n")
+
 e.append(" same => n,NoOp(CALLER not found)\n")
 e.append(" same => n,Set(__IF_CALLER_OK=0)\n")
 
-# if not ok -> reject
 e.append(" same => n(chk_ok),GotoIf($[${IF_CALLER_OK}=1]?route_dest:reject)\n")
 e.append(" same => n(reject),NoOp(REJECT caller=${CALLERID(num)} inactive/expired/unknown)\n")
 e.append(" same => n,Playback(ss-noservice)\n")
@@ -644,35 +582,47 @@ e.append(" same => n,Hangup(403)\n\n")
 e.append("[route_dest]\n")
 e.append("exten => _X.,1,NoOp(DEST ${EXTEN})\n")
 
-# destino apartamento
+dest_ramais = set([PORT_R] + list(ramais.keys()))
+dest_aps = set(str(a.get("numero","")).strip() for a in data.get("apartamentos",[]) if str(a.get("numero","")).strip())
+
+# can_call por ramal
+allow_rr = bool(policy.get("allow_resident_to_resident", False))
+caller_can_call = {}
+for r, meta in ramais.items():
+    allowed=[]
+    for d in policy.get("default_resident_can_call", ["PORTARIA"]):
+        allowed.append(str(d))
+    if allow_rr:
+        allowed.append("RESIDENTS")
+    for d in meta["obj"].get("can_call", []) or []:
+        allowed.append(str(d))
+    caller_can_call[r] = allowed
+
+# destino apartamento (AP): portaria sempre; morador só se explicitamente "AP:xxx"
 for ap in sorted(dest_aps, key=lambda x: int(x)):
     e.append(f"exten => {ap},1,NoOp(AP {ap} ringgroup)\n")
-    # policy: morador pode chamar AP? por default NÃO (anti-trote)
-    # Portaria pode chamar qualquer AP (na prática liga pros ramais do AP)
     e.append(f" same => n,GotoIf($[\"${{IF_CALLER_TYPE}}\"=\"PORTARIA\"]?do_ap_{ap}:chk_ap_policy_{ap})\n")
     e.append(f" same => n(chk_ap_policy_{ap}),NoOp(Check policy for AP)\n")
-    # permitido se user tem "AP:xxx" ou RESIDENTS (se allow_resident_to_resident, ainda assim AP é grupo — você decide via can_call)
     e.append(f" same => n,Set(__IF_ALLOWED=0)\n")
-    # Aqui valida por “macro” gerado (sem loops)
-    # Default: só se explicitamente no can_call
-    # (porque default_resident_can_call = PORTARIA)
+
     for r in sorted(ramais.keys()):
         allowed = caller_can_call[r]
-        if "AP:"+ap in allowed:
+        if ("AP:"+ap) in allowed:
             e.append(f' same => n,GotoIf($["{r}"="${{CALLERID(num)}}"]?allow_ap_{ap}:next_allow_ap_{ap}_{r})\n')
             e.append(f" same => n(allow_ap_{ap}),Set(__IF_ALLOWED=1)\n")
             e.append(f" same => n,Goto(do_ap_{ap})\n")
             e.append(f" same => n(next_allow_ap_{ap}_{r}),NoOp(.)\n")
+
     e.append(f" same => n,GotoIf($[${{IF_ALLOWED}}=1]?do_ap_{ap}:deny_ap_{ap})\n")
     e.append(f" same => n(deny_ap_{ap}),Playback(permission-denied)\n")
     e.append(" same => n,Hangup(403)\n")
 
-    # ringgroup do AP
     targets=[]
-    for r, meta in ramais.items():
+    for rr, meta in ramais.items():
         if meta["ap"] == ap:
-            targets.append(f"PJSIP/{r}")
+            targets.append(f"PJSIP/{rr}")
     dial="&".join(targets)
+
     e.append(f" same => n(do_ap_{ap}),Set(CDR(userfield)=${{CDR(userfield)}}|ap={ap})\n")
     if dial:
         e.append(f" same => n,Dial({dial},20,tT)\n")
@@ -683,20 +633,16 @@ for ap in sorted(dest_aps, key=lambda x: int(x)):
 # destino ramal
 for ext in sorted(dest_ramais, key=lambda x: int(x)):
     e.append(f"exten => {ext},1,NoOp(CALL RAMAL {ext})\n")
-    # se caller é portaria: ok (mas portaria também pode estar expirada — já checado)
     e.append(f" same => n,GotoIf($[\"${{IF_CALLER_TYPE}}\"=\"PORTARIA\"]?do_call_{ext}:chk_policy_{ext})\n")
     e.append(f" same => n(chk_policy_{ext}),NoOp(Policy for resident caller)\n")
-    # Morador -> Portaria sempre permitido se "PORTARIA" em allowed
+
     if ext == PORT_R:
-        # por default: permitido se policy default tem PORTARIA (sim)
         e.append(" same => n,Set(__IF_ALLOWED=1)\n")
         e.append(f" same => n,Goto(do_call_{ext})\n")
     else:
-        # Morador -> Morador: somente se allow_resident_to_resident = true
-        if policy.get("allow_resident_to_resident", False):
+        if allow_rr:
             e.append(" same => n,Set(__IF_ALLOWED=1)\n")
         else:
-            # ou se estiver explicitamente no can_call como "RAMAL:xxxx"
             e.append(" same => n,Set(__IF_ALLOWED=0)\n")
             for r in sorted(ramais.keys()):
                 allowed = caller_can_call[r]
@@ -705,11 +651,11 @@ for ext in sorted(dest_ramais, key=lambda x: int(x)):
                     e.append(f" same => n(allow_ramal_{ext}),Set(__IF_ALLOWED=1)\n")
                     e.append(f" same => n,Goto(do_call_{ext})\n")
                     e.append(f" same => n(next_allow_ramal_{ext}_{r}),NoOp(.)\n")
+
         e.append(f" same => n,GotoIf($[${{IF_ALLOWED}}=1]?do_call_{ext}:deny_{ext})\n")
         e.append(f" same => n(deny_{ext}),Playback(permission-denied)\n")
         e.append(" same => n,Hangup(403)\n")
 
-    # efetiva chamada
     e.append(f" same => n(do_call_{ext}),Set(CDR(userfield)=${{CDR(userfield)}}|to={ext})\n")
     e.append(f" same => n,Dial(PJSIP/{ext},30,tT)\n")
     e.append(" same => n,Hangup()\n\n")
@@ -721,7 +667,7 @@ e.append(" same => n,Hangup()\n\n")
 
 open(os.path.join(GEN_DIR, "extensions.interfone.generated.conf"), "w", encoding="utf-8").write("".join(e))
 
-# salva secrets (inclui senhas geradas)
+# salva secrets (inclui senhas geradas) e normaliza CFG
 json.dump(data, open(SECRETS, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 json.dump(data, open(CFG, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
 print("OK: gerado", os.path.join(GEN_DIR,"pjsip.interfone.generated.conf"), "e", os.path.join(GEN_DIR,"extensions.interfone.generated.conf"))
@@ -738,13 +684,12 @@ install_guard(){
 
   cat > "$GUARD_PY" <<'PY'
 #!/usr/bin/env python3
-import os, sys, subprocess, json, hashlib, datetime
+import os, sys, subprocess, hashlib, datetime
 
 CFG="/opt/interfone/condo.json"
 GEN_DIR="/etc/asterisk/interfone"
 PJSIP_GEN=os.path.join(GEN_DIR,"pjsip.interfone.generated.conf")
 EXT_GEN=os.path.join(GEN_DIR,"extensions.interfone.generated.conf")
-SECRETS="/root/interfone-secrets.json"
 
 def sha256(p):
     try:
@@ -755,15 +700,7 @@ def sha256(p):
 def run(cmd):
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-def regen():
-    # Chama o próprio generator do install via python inline: reaproveita o install.sh? (evita)
-    # Aqui simplesmente dispara: /usr/local/sbin/interfone-guard --apply (wrapper bash)
-    pass
-
 def main():
-    # Estratégia simples e robusta:
-    # - chama /usr/local/sbin/interfone-apply (wrapper) que regera configs
-    # - se houve mudança nos arquivos gerados (hash), dá reload
     before = (sha256(PJSIP_GEN), sha256(EXT_GEN))
     r = run(["/usr/local/sbin/interfone-apply"])
     after = (sha256(PJSIP_GEN), sha256(EXT_GEN))
@@ -773,12 +710,14 @@ def main():
         sys.exit(1)
 
     if before != after:
-        # reload leve
         run(["/usr/sbin/asterisk","-rx","pjsip reload"])
         run(["/usr/sbin/asterisk","-rx","dialplan reload"])
-        # marca log próprio
-        with open("/var/log/asterisk/security.log","a",encoding="utf-8") as f:
-            f.write(f"{datetime.datetime.now().strftime('%F %T')} [INTERFONE] guard reload due to config change\n")
+        try:
+            with open("/var/log/asterisk/security.log","a",encoding="utf-8") as f:
+                f.write(f"{datetime.datetime.now().strftime('%F %T')} [INTERFONE] guard reload due to config change\n")
+        except Exception:
+            pass
+
     sys.exit(0)
 
 if __name__=="__main__":
@@ -786,7 +725,7 @@ if __name__=="__main__":
 PY
   chmod 755 "$GUARD_PY"
 
-  # wrapper apply: reusa a lógica do generator (mesmo código do install)
+  # wrapper apply
   cat > /usr/local/sbin/interfone-apply <<'B'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -794,7 +733,6 @@ CFG="/opt/interfone/condo.json"
 SECRETS="/root/interfone-secrets.json"
 GEN_DIR="/etc/asterisk/interfone"
 
-# detect IP (mesma estratégia do install)
 detect_ip(){
   local ip=""
   ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
@@ -812,24 +750,27 @@ mkdir -p "$GEN_DIR"
 chmod 700 "$GEN_DIR"
 
 python3 - "$CFG" "$SECRETS" "$VPS_IP" "$GEN_DIR" <<'PY'
-# Reaproveita exatamente o gerador do install (copiado aqui para ficar independente)
 import json, secrets, string, sys, os, re, datetime
 
 CFG, SECRETS, VPS_IP, GEN_DIR = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+
 def gen_pass(n=20):
     a = string.ascii_letters + string.digits + "._-@:+#="
     return "".join(secrets.choice(a) for _ in range(n))
+
 def clean_ext(x):
     x = str(x).strip()
     if not re.fullmatch(r"\d{2,10}", x):
         raise SystemExit(f"Ramal inválido: {x}")
     return x
+
 def parse_dt(s):
     if s is None: return None
     s=str(s).strip()
     if not s or s.lower() in ("null","none"): return None
     if "T" in s: return datetime.datetime.fromisoformat(s)
     return datetime.datetime.fromisoformat(s+"T23:59:59")
+
 def is_active(obj):
     if obj is None: return True
     if obj.get("active", True) is False: return False
@@ -870,7 +811,7 @@ for ap in data.get("apartamentos", []):
             raise SystemExit(f"Ramal duplicado: {m['ramal']}")
         ramais[m["ramal"]]={"ap":apnum,"nome":m["nome"],"obj":m}
 
-# --- PJSIP ---
+# PJSIP
 p=[]
 p.append("; INTERFONE - GERADO AUTOMATICAMENTE\n\n")
 p.append("[global]\n")
@@ -899,6 +840,7 @@ p.append("dtmf_mode=rfc4733\n\n")
 
 p.append("[aor-common](!)\n")
 p.append("type=aor\nmax_contacts=3\nremove_existing=yes\nqualify_frequency=30\n\n")
+
 p.append("[auth-common](!)\n")
 p.append("type=auth\nauth_type=userpass\n\n")
 
@@ -914,7 +856,7 @@ for r, meta in sorted(ramais.items(), key=lambda x: x[0]):
 
 open(os.path.join(GEN_DIR,"pjsip.interfone.generated.conf"),"w",encoding="utf-8").write("".join(p))
 
-# --- DIALPLAN ---
+# DIALPLAN
 e=[]
 e.append("; INTERFONE - GERADO AUTOMATICAMENTE\n\n")
 e.append("[from-interfone]\n")
@@ -930,18 +872,19 @@ e.append(f' same => n,GotoIf($["{PORT_R}"="${{CALLERID(num)}}"]?is_portaria:chk_
 e.append(" same => n(is_portaria),Set(__IF_CALLER_TYPE=PORTARIA)\n")
 e.append(f" same => n,Set(__IF_CALLER_OK={'1' if is_active(data['portaria']) else '0'})\n")
 e.append(" same => n,Goto(chk_ok)\n")
+
 e.append(" same => n(chk_res),NoOp(CALLER resident check)\n")
 for r, meta in sorted(ramais.items(), key=lambda x: x[0]):
-    ok = is_active(meta["obj"]) and True
-    e.append(f' same => n,GotoIf($["{r}"="${{CALLERID(num)}}"]?caller_{r}:nextcaller_{r})\n')
-    e.append(f" same => n(caller_{r}),Set(__IF_CALLER_TYPE=RESIDENT)\n")
-    # também checa AP ativo/expiração
     apnum = meta["ap"]
     ap_obj = next((a for a in data.get("apartamentos",[]) if str(a.get("numero","")).strip()==apnum), {})
-    ok = ok and is_active(ap_obj)
+    ok = is_active(meta["obj"]) and is_active(ap_obj)
+
+    e.append(f' same => n,GotoIf($["{r}"="${{CALLERID(num)}}"]?caller_{r}:nextcaller_{r})\n')
+    e.append(f" same => n(caller_{r}),Set(__IF_CALLER_TYPE=RESIDENT)\n")
     e.append(f" same => n,Set(__IF_CALLER_OK={'1' if ok else '0'})\n")
     e.append(" same => n,Goto(chk_ok)\n")
     e.append(f" same => n(nextcaller_{r}),NoOp(.)\n")
+
 e.append(" same => n,Set(__IF_CALLER_OK=0)\n")
 e.append(" same => n(chk_ok),GotoIf($[${IF_CALLER_OK}=1]?route_dest:reject)\n")
 e.append(" same => n(reject),Playback(ss-noservice)\n")
@@ -953,15 +896,14 @@ e.append("exten => _X.,1,NoOp(DEST ${EXTEN})\n")
 dest_ramais=set([PORT_R]+list(ramais.keys()))
 dest_aps=set(str(a.get("numero","")).strip() for a in data.get("apartamentos",[]) if str(a.get("numero","")).strip())
 
-# AP calls: só portaria por default (a não ser can_call AP:xxx)
+# AP calls: só portaria por default
 for ap in sorted(dest_aps, key=lambda x: int(x)):
     e.append(f"exten => {ap},1,NoOp(AP {ap} ringgroup)\n")
     e.append(f" same => n,GotoIf($[\"${{IF_CALLER_TYPE}}\"=\"PORTARIA\"]?do_ap_{ap}:deny_ap_{ap})\n")
-    # ringgroup
     targets=[]
-    for r, meta in ramais.items():
+    for rr, meta in ramais.items():
         if meta["ap"]==ap:
-            targets.append(f"PJSIP/{r}")
+            targets.append(f"PJSIP/{rr}")
     dial="&".join(targets)
     e.append(f" same => n(do_ap_{ap}),Set(CDR(userfield)=${{CDR(userfield)}}|ap={ap})\n")
     if dial:
@@ -972,10 +914,9 @@ for ap in sorted(dest_aps, key=lambda x: int(x)):
     e.append(f" same => n(deny_ap_{ap}),Playback(permission-denied)\n")
     e.append(" same => n,Hangup(403)\n\n")
 
-# Ramal calls: morador -> portaria ok; morador -> morador só se allow_resident_to_resident ou can_call RAMAL:xxxx
+# Ramal calls
 allow_rr = bool(policy.get("allow_resident_to_resident", False))
 
-# prepara can_call por ramal
 caller_can = {}
 for r, meta in ramais.items():
     allowed=[]
@@ -993,13 +934,11 @@ for ext in sorted(dest_ramais, key=lambda x: int(x)):
     e.append(f" same => n(chk_{ext}),Set(__IF_ALLOWED=0)\n")
 
     if ext == PORT_R:
-        # morador -> portaria (PORTARIA deve estar no default)
         e.append(" same => n,Set(__IF_ALLOWED=1)\n")
     else:
         if allow_rr:
             e.append(" same => n,Set(__IF_ALLOWED=1)\n")
         else:
-            # verifica can_call RAMAL:ext
             for r in sorted(ramais.keys(), key=lambda x: int(x)):
                 if f"RAMAL:{ext}" in caller_can.get(r,set()):
                     e.append(f' same => n,GotoIf($["{r}"="${{CALLERID(num)}}"]?allow_{ext}:next_{ext}_{r})\n')
@@ -1033,7 +972,6 @@ exec ${GUARD_PY} "\$@"
 EOF
   chmod 755 "$GUARD_BIN"
 
-  # systemd service + timer
   cat > /etc/systemd/system/interfone-guard.service <<'S'
 [Unit]
 Description=Interfone Guard (regen + reload on changes)
